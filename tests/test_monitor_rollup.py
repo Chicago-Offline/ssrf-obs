@@ -187,3 +187,51 @@ class ParamMergeTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MonitorRenderTest(unittest.TestCase):
+    """The page must SHOW silence, not just store it."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.db = db_mod.DB(os.path.join(self.dir, "t.db"))
+
+    def test_empty_state_names_the_missing_config(self):
+        page = web.render(self.db, {})
+        self.assertIn("Channel monitoring", page)
+        self.assertIn("nothing monitored yet", page)
+        # An empty section must say WHAT to add, or it reads as broken.
+        self.assertIn("targets_file", page)
+
+    def test_never_heard_channel_is_visible_on_the_page(self):
+        # channels() hides never-heard entries; the monitoring section is
+        # the only place this finding can surface at all. Checks must span
+        # DAYS, not hours: never_heard needs volume AND span, so hourly
+        # samples would (correctly) still read "watching".
+        self.db.insert_batch(_batch(
+            [_chk(ts=NOW - i * (DAY / 4), heard=False) for i in range(60)]))
+        page = web.render(self.db, {})
+        self.assertIn("145.4700 MHz", page)
+        self.assertIn("NEVER HEARD", page)
+        self.assertIn(web.MON_BADGE["never_heard"], page)
+
+    def test_thin_silence_shows_watching_not_an_accusation(self):
+        self.db.insert_batch(_batch([_chk(heard=False)]))
+        page = web.render(self.db, {})
+        self.assertIn("WATCHING", page)
+        self.assertNotIn("NEVER HEARD", page)
+
+    def test_silent_row_still_names_its_observers(self):
+        # "never heard" with no attribution is an unattributable claim.
+        self.db.insert_batch(_batch(
+            [_chk(ts=NOW - i * (DAY / 4), heard=False) for i in range(60)]))
+        page = web.render(self.db, {})
+        self.assertIn("sta-a/rtl:0", page)
+
+    def test_heard_channel_reports_hit_rate(self):
+        checks = [_chk(ts=NOW - i * 3600, heard=(i % 4 == 0))
+                  for i in range(60)]
+        self.db.insert_batch(_batch(checks))
+        page = web.render(self.db, {})
+        self.assertIn("Channel monitoring", page)
+        self.assertNotIn("NEVER HEARD", page)

@@ -355,19 +355,6 @@ PAGE = """<!doctype html>
 <h2>Recent observations <span class="n">last {recentn}</span></h2>
 {recent}
 
-<h2>Channel roll-up <span class="n">every frequency ever heard</span></h2>
-<p class="sub">The archive, not the live picture &mdash; one row per distinct
- frequency across the whole append-only DB, which is why it is long. Its job
- is to show <em>coverage gaps</em>: a resolved channel with no name is a
- missing <a href="https://chicago-offline.github.io/ssrf-lite/">ssrf-lite</a>
- entry worth filing. <span class="hint">(input)</span> = matched a repeater's
- input side. <span class="hint">(near)</span> = off-raster, matched inside the
- tolerance window. <span class="unk">&mdash;</span> = no entry in ssrf-lite
- yet. <span class="hint">(unresolved)</span> rows are sweep artifacts, not
- channels &mdash; the bin was too wide to identify one channel, so they are
- hidden by default.</p>
-{channels}
-
 <h2>Channel monitoring <span class="n">{monitorn}</span></h2>
 <p class="sub">Catalog channels checked on a schedule whether or not the
  sweep sees energy there &mdash; the answer to &ldquo;is this repeater
@@ -383,6 +370,19 @@ PAGE = """<!doctype html>
  a scan list cares about. Targets are fenced by distance, so a repeater
  nobody here could hear is absent rather than slandered as silent.</p>
 {monitors}
+
+<h2>Channel roll-up <span class="n">every frequency ever heard</span></h2>
+<p class="sub">The archive, not the live picture &mdash; one row per distinct
+ frequency across the whole append-only DB, which is why it is long. Its job
+ is to show <em>coverage gaps</em>: a resolved channel with no name is a
+ missing <a href="https://chicago-offline.github.io/ssrf-lite/">ssrf-lite</a>
+ entry worth filing. <span class="hint">(input)</span> = matched a repeater's
+ input side. <span class="hint">(near)</span> = off-raster, matched inside the
+ tolerance window. <span class="unk">&mdash;</span> = no entry in ssrf-lite
+ yet. <span class="hint">(unresolved)</span> rows are sweep artifacts, not
+ channels &mdash; the bin was too wide to identify one channel, so they are
+ hidden by default.</p>
+{channels}
 
 <h2>Beacon calibration</h2>
 <p class="sub">Reference emitters (NETWORK.md &sect;7) bound

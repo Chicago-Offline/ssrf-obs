@@ -8,6 +8,8 @@ Routes:
   /active.json   channels heard inside the live window, newest first
   /feed.json     recent observations, newest first (?limit=, ?freq=)
   /channels.json per-channel verification rollup (same data as `report`)
+  /monitors.json catalog-channel rollup from monitor checks: last heard,
+                 hit rate, which observers, per-parameter verification
   /stations.json enrolled stations + last-heard
   /names.json    status of the optional freq -> name index
 
@@ -95,6 +97,31 @@ def channels(db, index=None):
         ok = any(snapped(r[6]) for r in rows)
         st["channel_snap"] = ok
         out[f] = _with_name(st, identify(index, f) if ok else None)
+    return out
+
+
+def monitors(db, index=None):
+    """Catalog-channel rollup: does the published record hold up?
+
+    Keyed by "<freq> <target>", not by frequency alone. Two targets can
+    legitimately share one frequency when they are tone-discriminated, so
+    frequency is not a key here -- unlike channels(), which is derived
+    from observations and has no target to split on.
+
+    Rows with ZERO hearings are kept, which is the whole difference from
+    channels(). "We have checked this repeater 214 times over six weeks
+    and never heard it" is the finding, not an empty result to filter out.
+    """
+    groups = {}
+    for r in db.monitor_check_rows():
+        groups.setdefault((r[5], r[3]), []).append(r)
+    out = {}
+    for (freq_hz, target), rows in sorted(groups.items()):
+        st = rules.monitor_rollup(rows)
+        if not st:
+            continue
+        key = "%.4f MHz %s" % (freq_hz / 1e6, target)
+        out[key] = _with_name(st, identify(index, freq_hz))
     return out
 
 
@@ -301,6 +328,7 @@ PAGE = """<!doctype html>
  Feed: <a href="/active.json">/active.json</a> &middot;
  <a href="/feed.json">/feed.json</a> &middot;
  <a href="/channels.json">/channels.json</a> &middot;
+ <a href="/monitors.json">/monitors.json</a> &middot;
  <a href="/stations.json">/stations.json</a> &middot;
  <a href="/beacons.json">/beacons.json</a> &middot;
  <a href="/receivers.json">/receivers.json</a> &middot;
@@ -647,6 +675,11 @@ def make_handler(db, registry, index=None):
                     self._json({"%.4f MHz" % (f / 1e6): c
                                 for f, c in sorted(
                                     channels(db, index).items())})
+                elif u.path == "/monitors.json":
+                    mons = monitors(db, index)
+                    self._json({"generated": time.time(),
+                                "count": len(mons),
+                                "monitors": mons})
                 elif u.path == "/stations.json":
                     self._json({"stations": stations(db, registry)})
                 elif u.path == "/beacons.json":

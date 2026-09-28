@@ -235,3 +235,11 @@ class MonitorRenderTest(unittest.TestCase):
         page = web.render(self.db, {})
         self.assertIn("Channel monitoring", page)
         self.assertNotIn("NEVER HEARD", page)
+
+    def test_monitoring_section_precedes_the_roll_up(self):
+        # The roll-up is ~70% of the page by bytes, so anything below it is
+        # effectively unreachable by scrolling. Monitoring answers "is this
+        # repeater on the air", which is the question people arrive with.
+        page = web.render(self.db, {})
+        self.assertLess(page.index("Channel monitoring"),
+                        page.index("Channel roll-up"))

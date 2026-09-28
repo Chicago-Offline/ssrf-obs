@@ -18,6 +18,32 @@ MIN_DAYS = 3
 STALE_DAYS = 90
 
 
+DIGITAL_DECODERS = ("dmr", "p25", "nxdn", "dstar", "ysf")
+
+
+def has_decode_identity(m):
+    """Did a digital decode actually recover identifying metadata?
+
+    Two vocabularies reach this DB and both are legitimate. NETWORK.md S4
+    describes the concept as "CC/TG/NAC/radio IDs" without pinning key names,
+    so accept the compact spelling AND the one rf-survey's dwell_dmr() really
+    emits (color_codes / talkgroups / radio_ids, passed through verbatim by
+    submit.py). Reading only the compact form silently graded every successful
+    DMR decode as V0, which is why nothing could ever reach "verified".
+
+    cc/nac use "is not None" because color code 0 and NAC 0 are valid.
+
+    sync_lines is deliberately NOT accepted: dsd-family decoders fabricate
+    sync on pure noise (rf-survey dwell.py says so in its module docstring),
+    so a sync count is not identity. dwell_dmr's own "active" flag makes the
+    same call.
+    """
+    if m.get("cc") is not None or m.get("nac") is not None or m.get("tgs"):
+        return True
+    return bool(m.get("color_codes") or m.get("talkgroups")
+                or m.get("radio_ids"))
+
+
 def tier(gated, decoder, meta):
     if not gated:
         return None
@@ -26,8 +52,7 @@ def tier(gated, decoder, meta):
         return 3
     if m.get("voice"):
         return 2
-    if decoder in ("dmr", "p25", "nxdn", "dstar", "ysf") and (
-            m.get("cc") is not None or m.get("nac") is not None or m.get("tgs")):
+    if decoder in DIGITAL_DECODERS and has_decode_identity(m):
         return 1
     return 0
 

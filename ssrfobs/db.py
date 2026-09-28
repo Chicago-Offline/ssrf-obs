@@ -62,6 +62,42 @@ CREATE TABLE IF NOT EXISTS beacon_readings (
   status TEXT NOT NULL        -- ok | not_heard | no_reference | error
 );
 CREATE INDEX IF NOT EXISTS beacon_rx ON beacon_readings(station_id, receiver, ref_id, ts);
+
+-- Monitor checks (rf-survey NETWORK.md S2/S3): one row per target check,
+-- INCLUDING the silent ones (heard=0), which are the majority and the
+-- whole point. Without a record of having looked and heard nothing, a
+-- quiet channel is indistinguishable from one no observer ever visited,
+-- so "when was this last heard" and "has anyone ever heard it" are
+-- unanswerable. Never collapse these to hearings-only.
+--
+-- target + ssrf_id are the catalog join keys, and params carries the
+-- per-parameter grades from the station-side verify_params(). Neither
+-- survives the generic observations path, which is why monitor evidence
+-- gets its own table rather than being folded into observations.
+--
+-- Keyed by OBSERVER (station_id, receiver) for the same reason as
+-- beacon_readings: receiver names are station-local and collide across
+-- stations (every host has an rtl:0), so counting bare receiver would
+-- invent corroboration between two dongles that are actually one.
+CREATE TABLE IF NOT EXISTS monitor_checks (
+  id INTEGER PRIMARY KEY,
+  batch_id TEXT NOT NULL REFERENCES batches(id),
+  station_id TEXT NOT NULL,
+  src_id INTEGER,
+  ts REAL NOT NULL,
+  receiver TEXT NOT NULL,
+  target TEXT NOT NULL,
+  ssrf_id TEXT,
+  freq_hz INTEGER NOT NULL,
+  decoder TEXT,
+  heard INTEGER NOT NULL,
+  snr_db REAL,
+  params TEXT, meta TEXT,
+  lat REAL, lon REAL, alt_m REAL, fix TEXT
+);
+CREATE INDEX IF NOT EXISTS mc_chan ON monitor_checks(freq_hz, target, ts);
+CREATE INDEX IF NOT EXISTS mc_ssrf ON monitor_checks(ssrf_id);
+CREATE INDEX IF NOT EXISTS mc_obs ON monitor_checks(station_id, receiver);
 """
 
 
@@ -127,6 +163,20 @@ class DB:
               b.get("snr_db"), b.get("gain"), 1 if b.get("pinned") else 0,
               b.get("status"))
              for b in batch.get("beacon_readings", []) or []])
+        self.db.executemany(
+            "INSERT INTO monitor_checks(batch_id,station_id,src_id,ts,"
+            "receiver,target,ssrf_id,freq_hz,decoder,heard,snr_db,params,"
+            "meta,lat,lon,alt_m,fix)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            [(batch["batch_id"], batch["station_id"], c.get("id"),
+              c.get("ts"), c.get("receiver"), c.get("target"),
+              c.get("ssrf_id"), c.get("freq_hz"), c.get("decoder"),
+              1 if c.get("heard") else 0, c.get("snr_db"),
+              json.dumps(c.get("params") or {}),
+              json.dumps(c.get("meta") or {}),
+              c.get("lat"), c.get("lon"), c.get("alt_m"), c.get("fix"))
+             for c in batch.get("monitor_checks", []) or []
+             if c.get("target") and c.get("freq_hz") is not None])
         self.db.commit()
         return True
 
@@ -147,6 +197,29 @@ class DB:
             "SELECT station_id,receiver,role,gain,antenna,placement,"
             "updated_at FROM receivers").fetchall()
         return [dict(zip(cols, r)) for r in rows]
+
+    def monitor_check_rows(self, freq_hz=None, ssrf_id=None):
+        """Raw monitor checks, silent ones included.
+
+        Returns (station_id, receiver, ts, target, ssrf_id, freq_hz,
+        decoder, heard, snr_db, params, meta), oldest first.
+
+        No heard=1 filter, deliberately: the silent rows are what make
+        "last heard" and "never observed" answerable, so filtering them
+        here would defeat the reason the table exists.
+        """
+        q = ("SELECT station_id,receiver,ts,target,ssrf_id,freq_hz,decoder,"
+             "heard,snr_db,params,meta FROM monitor_checks")
+        args, where = [], []
+        if freq_hz:
+            where.append("freq_hz=?")
+            args.append(freq_hz)
+        if ssrf_id:
+            where.append("ssrf_id=?")
+            args.append(ssrf_id)
+        if where:
+            q += " WHERE " + " AND ".join(where)
+        return self.db.execute(q + " ORDER BY ts", args).fetchall()
 
     def beacon_latest(self):
         """Most recent reading per (station_id, receiver, ref_id)."""

@@ -279,6 +279,14 @@ def _ago(ts):
 BADGE = {"verified": "#39FF14", "observed": "#00E5FF",
          "flagged": "#FFB300", "stale": "#888"}
 
+# Monitor statuses are NOT the V0-V3 evidence tiers, so they deliberately
+# do not reuse BADGE. A tier grades how well a signal was captured;
+# a monitor status describes OUR listening. Red on never_heard is the
+# point: it is the only status that accuses a catalog entry of being
+# wrong, and it should look like an accusation.
+MON_BADGE = {"active": "#39FF14", "stale": "#FFB300", "dormant": "#888",
+             "never_heard": "#FF5252", "watching": "#00E5FF"}
+
 
 PAGE = """<!doctype html>
 <meta charset="utf-8">
@@ -359,6 +367,22 @@ PAGE = """<!doctype html>
  channels &mdash; the bin was too wide to identify one channel, so they are
  hidden by default.</p>
 {channels}
+
+<h2>Channel monitoring <span class="n">{monitorn}</span></h2>
+<p class="sub">Catalog channels checked on a schedule whether or not the
+ sweep sees energy there &mdash; the answer to &ldquo;is this repeater
+ actually on the air?&rdquo; A <em>silent</em> check is the whole point: it
+ is what separates a dead machine from one nobody ever pointed a receiver
+ at. <code>watching</code> = checked, but not yet hard enough to claim
+ anything. <code>never_heard</code> = checked hard enough to mean it and
+ still always silent, which is a finding against the
+ <a href="https://chicago-offline.github.io/ssrf-lite/">ssrf-lite</a>
+ entry &mdash; so it takes many checks across many days before it will say
+ so. Hit rate is over checks actually performed, not over wall time: it
+ answers &ldquo;when we listen, how often is it there&rdquo;, which is what
+ a scan list cares about. Targets are fenced by distance, so a repeater
+ nobody here could hear is absent rather than slandered as silent.</p>
+{monitors}
 
 <h2>Beacon calibration</h2>
 <p class="sub">Reference emitters (NETWORK.md &sect;7) bound
@@ -623,10 +647,55 @@ def render(db, registry, index=None):
                    '&mdash; run <code>survey beacon-check --serial '
                    '&lt;serial&gt;</code> on an observer</p>')
 
+    mons = monitors(db, index)
+    if mons:
+        rows = ""
+        tally = {}
+        for _key, m in sorted(mons.items(),
+                              key=lambda kv: (kv[1]["freq_hz"] or 0,
+                                              kv[1]["target"] or "")):
+            tally[m["status"]] = tally.get(m["status"], 0) + 1
+            color = MON_BADGE.get(m["status"], "#888")
+            mhz = (m["freq_hz"] or 0) / 1e6
+            obs = m["observers"] or []
+            heard_by = m["observers_heard"] or []
+            # Show who HEARD it when anyone has, otherwise who is
+            # listening. A silent row still has to name its observers or
+            # "never heard" is an unattributable claim.
+            who = ", ".join(heard_by or obs)
+            rows += "<tr>" + "".join((
+                _td("%.4f MHz" % mhz, "%.6f" % mhz),
+                _td(html.escape(m["target"] or "-"), m["target"] or ""),
+                _td(html.escape(m["decoder"] or "-"), m["decoder"] or ""),
+                _td('<span class="b" style="background:%s">%s</span>'
+                    % (color, m["status"].upper().replace("_", " ")),
+                    m["status"]),
+                _td(m["checks"], m["checks"]),
+                _td(m["hearings"], m["hearings"]),
+                _td("%.0f%%" % (m["hit_rate"] * 100), m["hit_rate"]),
+                _td(_ago(m["last_heard"]), m["last_heard"] or ""),
+                _td(_ago(m["last_checked"]), m["last_checked"] or ""),
+                _td(html.escape(who) or '<span class="unk">&mdash;</span>',
+                    who, cls="who"),
+            )) + "</tr>"
+        mon_html = _table(["frequency", "target", "mode", "status",
+                           "checks", "heard", "hit rate", "last heard",
+                           "last checked", "observers"],
+                          rows, tid="montable")
+        mon_n = ", ".join("%d %s" % (n, s.replace("_", " "))
+                          for s, n in sorted(tally.items(),
+                                             key=lambda kv: (-kv[1], kv[0])))
+    else:
+        mon_html = ('<p class="empty">nothing monitored yet &mdash; add a '
+                    "<code>monitor:</code> block with a "
+                    "<code>targets_file</code> to an observer plan</p>")
+        mon_n = "none"
+
     return PAGE.format(active=act_html, livecount=act_n, livedot=act_dot,
                        window=ACTIVE_WINDOW_S // 60,
                        stations=st_html, channels=ch_html, recent=rc_html,
-                       recentn=len(items), beacons=bc_html, script=SCRIPT,
+                       recentn=len(items), monitors=mon_html, monitorn=mon_n,
+                       beacons=bc_html, script=SCRIPT,
                        now=time.strftime("%Y-%m-%d %H:%M:%SZ", time.gmtime()))
 
 

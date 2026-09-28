@@ -8,6 +8,7 @@ Routes:
   /feed.json     recent observations, newest first (?limit=, ?freq=)
   /channels.json per-channel verification rollup (same data as `report`)
   /stations.json enrolled stations + last-heard
+  /names.json    status of the optional freq -> name index
 
 Station public keys are NEVER served -- only station ids.
 """
@@ -18,7 +19,7 @@ import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from . import rules
+from . import names as names_mod, rules
 
 log = logging.getLogger(__name__)
 
@@ -26,15 +27,68 @@ MAX_LIMIT = 500
 DEFAULT_LIMIT = 100
 
 
-def channels(db):
-    """Per-channel rollup keyed by freq_hz."""
+def identify(index, freq_hz):
+    """Name a frequency via the optional index. Never raises."""
+    if index is None:
+        return None
+    try:
+        return index.lookup(freq_hz)
+    except Exception:                                    # noqa: BLE001
+        log.exception("name lookup failed for %s", freq_hz)
+        return None
+
+
+def snapped(meta):
+    """Did rf-survey resolve this hit to a channel raster point?
+
+    meta["channel_snap"] is the surveyor's own verdict: it snapped freq_hz to
+    the raster because the rtl_power bin was narrow enough to identify one
+    channel. False/absent means the measurement could not resolve a channel,
+    so freq_hz is a bin centre, not a channel -- and must not be named.
+
+    Accepts either a decoded dict or the raw JSON text SQLite hands back.
+    """
+    if isinstance(meta, (str, bytes)):
+        try:
+            meta = json.loads(meta or "{}")
+        except (ValueError, TypeError):
+            return False
+    if not isinstance(meta, dict):
+        return False
+    return bool(meta.get("channel_snap"))
+
+
+def _with_name(row, ident):
+    """Attach identity fields to a rollup/feed row. Always the same keys."""
+    row["name"] = ident["name"] if ident else None
+    row["callsign"] = ident["callsign"] if ident else None
+    row["service"] = ident["service"] if ident else None
+    row["name_side"] = ident["side"] if ident else None
+    row["name_exact"] = ident["exact"] if ident else None
+    row["names"] = ident["names"] if ident else []
+    row["matches"] = ident["matches"] if ident else 0
+    return row
+
+
+def channels(db, index=None):
+    """Per-channel rollup keyed by freq_hz.
+
+    With a name index configured, each row also carries who is known to use
+    that frequency. Grading never depends on it -- an unnamed channel grades
+    exactly as before, it just reads as a bare frequency.
+    """
     freqs = sorted({r[0] for r in db.db.execute(
         "SELECT DISTINCT freq_hz FROM observations").fetchall()})
     out = {}
     for f in freqs:
-        st = rules.channel_status(db.observation_rows(f))
-        if st:
-            out[f] = st
+        rows = db.observation_rows(f)
+        st = rules.channel_status(rows)
+        if not st:
+            continue
+        # Only name a frequency the surveyor actually resolved to a channel.
+        ok = any(snapped(r[6]) for r in rows)
+        st["channel_snap"] = ok
+        out[f] = _with_name(st, identify(index, f) if ok else None)
     return out
 
 
@@ -57,7 +111,7 @@ def stations(db, registry):
             for sid in sorted(registry)]
 
 
-def feed(db, limit=DEFAULT_LIMIT, freq_hz=None):
+def feed(db, limit=DEFAULT_LIMIT, freq_hz=None, index=None):
     """Recent observations, newest first."""
     q = ("SELECT station_id, ts, receiver, freq_hz, snr_db, duration_s,"
          " decoder, gated, meta FROM observations")
@@ -71,13 +125,16 @@ def feed(db, limit=DEFAULT_LIMIT, freq_hz=None):
     for (sid, ts, rx, f, snr, dur, dec, gated, meta) in db.db.execute(q, args):
         m = json.loads(meta or "{}")
         t = rules.tier(gated, dec, m)
-        items.append({"station_id": sid, "ts": ts, "receiver": rx,
-                      "freq_hz": f,
-                      "freq_mhz": round(f / 1e6, 4) if f else None,
-                      "snr_db": snr, "duration_s": dur, "decoder": dec,
-                      "gated": bool(gated),
-                      "level": "V%d" % t if t is not None else None,
-                      "meta": m})
+        items.append(_with_name(
+            {"station_id": sid, "ts": ts, "receiver": rx,
+             "freq_hz": f,
+             "freq_mhz": round(f / 1e6, 4) if f else None,
+             "snr_db": snr, "duration_s": dur, "decoder": dec,
+             "gated": bool(gated),
+             "level": "V%d" % t if t is not None else None,
+             "channel_snap": snapped(m),
+             "meta": m},
+            identify(index, f) if snapped(m) else None))
     return items
 
 
@@ -162,6 +219,8 @@ PAGE = """<!doctype html>
  .lvl{{color:#FFB300}}
  a{{color:#00E5FF}}
  .empty{{color:#6d7f8b;font-style:italic}}
+ .hint{{color:#6d7f8b;font-size:11px}}
+ .unk{{color:#42525c}}
  footer{{color:#42525c;margin-top:2.5rem;font-size:12px}}
 </style>
 <h1>&#128225; CHICAGO OFFLINE &mdash; RF OBSERVERS</h1>
@@ -170,12 +229,20 @@ PAGE = """<!doctype html>
  <a href="/channels.json">/channels.json</a> &middot;
  <a href="/stations.json">/stations.json</a> &middot;
  <a href="/beacons.json">/beacons.json</a> &middot;
- <a href="/receivers.json">/receivers.json</a></p>
+ <a href="/receivers.json">/receivers.json</a> &middot;
+ <a href="/names.json">/names.json</a></p>
 
 <h2>Stations</h2>
 {stations}
 
 <h2>Channels</h2>
+<p class="sub">Station / system names are matched by frequency against the
+ curated <a href="https://chicago-offline.github.io/ssrf-lite/">ssrf-lite</a>
+ channel index. They say who is <em>known to use</em> the channel &mdash; not
+ who was identified on the air, which is what the tier column is for.
+ <span class="hint">(input)</span> = matched a repeater's input side.
+ <span class="hint">(near)</span> = off-raster, matched inside the tolerance
+ window. <span class="unk">&mdash;</span> = no entry in ssrf-lite yet.</p>
 {channels}
 
 <h2>Recent observations</h2>
@@ -195,7 +262,39 @@ PAGE = """<!doctype html>
 """
 
 
-def render(db, registry):
+def _ident_cell(row):
+    """Identity table cell: the name, plus hints when the match is indirect."""
+    name = row.get("name")
+    if not name:
+        if row.get("channel_snap") is False:
+            # Not "we don't know who" but "the sweep couldn't resolve a
+            # channel here", which is a different (and fixable) problem.
+            return ('<td class="unk">&mdash; <span class="hint"'
+                    ' title="rf-survey could not snap this hit to a channel'
+                    ' raster point, so the frequency is a bin centre rather'
+                    ' than a channel. Needs a narrower sweep bin or a'
+                    ' refined dwell before it can be named.">'
+                    '(unresolved)</span></td>')
+        return '<td class="unk">&mdash;</td>'
+    extra = []
+    call = row.get("callsign")
+    if call and call != name:
+        extra.append(call)
+    if row.get("name_side") == "in":
+        extra.append("input")
+    if row.get("name_exact") is False:
+        extra.append("near")
+    n = row.get("matches") or 0
+    if n > 1:
+        extra.append("+%d more" % (n - 1))
+    cell = html.escape(name)
+    if extra:
+        cell += ' <span class="hint">(%s)</span>' % html.escape(
+            ", ".join(extra))
+    return "<td>%s</td>" % cell
+
+
+def render(db, registry, index=None):
     sts = stations(db, registry)
     if sts:
         rows = "".join(
@@ -208,37 +307,41 @@ def render(db, registry):
     else:
         st_html = '<p class="empty">no stations enrolled</p>'
 
-    ch = channels(db)
+    ch = channels(db, index)
     if ch:
         rows = ""
         for f, c in sorted(ch.items()):
             color = BADGE.get(c["status"], "#888")
             rows += (
-                '<tr><td>%.4f MHz</td><td class="lvl">%s</td>'
+                '<tr><td>%.4f MHz</td>%s<td class="lvl">%s</td>'
                 '<td><span class="b" style="background:%s">%s</span></td>'
                 '<td>%s</td><td>%s</td></tr>' % (
-                    f / 1e6, c["level"], color, c["status"].upper(),
+                    f / 1e6, _ident_cell(c), c["level"], color,
+                    c["status"].upper(),
                     _ago(c["last_heard"]), c["v1_stations"]))
-        ch_html = ("<table><tr><th>frequency<th>tier<th>status"
-                   "<th>last heard<th>V1 stations</tr>" + rows + "</table>")
+        ch_html = ("<table><tr><th>frequency<th>station / system<th>tier"
+                   "<th>status<th>last heard<th>V1 stations</tr>"
+                   + rows + "</table>")
     else:
         ch_html = ('<p class="empty">no graded channels yet &mdash; '
                    'stations are sweeping, nothing has tripped the dwell gate'
                    '</p>')
 
-    items = feed(db, limit=25)
+    items = feed(db, limit=25, index=index)
     if items:
         rows = "".join(
-            "<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td>"
+            "<tr><td>%s</td><td>%s</td><td>%s</td>%s<td>%s</td>"
             '<td class="lvl">%s</td><td>%s</td></tr>' % (
                 _ago(o["ts"]), html.escape(o["station_id"]),
                 "%.4f" % o["freq_mhz"] if o["freq_mhz"] else "?",
+                _ident_cell(o),
                 html.escape(o["decoder"] or "-"),
                 o["level"] or "-",
                 "%.1f" % o["snr_db"] if o["snr_db"] is not None else "-")
             for o in items)
-        rc_html = ("<table><tr><th>when<th>station<th>MHz<th>decoder"
-                   "<th>tier<th>SNR dB</tr>" + rows + "</table>")
+        rc_html = ("<table><tr><th>when<th>observer<th>MHz"
+                   "<th>station / system<th>decoder<th>tier<th>SNR dB</tr>"
+                   + rows + "</table>")
     else:
         rc_html = '<p class="empty">no observations yet</p>'
 
@@ -271,7 +374,7 @@ def render(db, registry):
                        now=time.strftime("%Y-%m-%d %H:%M:%SZ", time.gmtime()))
 
 
-def make_handler(db, registry):
+def make_handler(db, registry, index=None):
     class Handler(BaseHTTPRequestHandler):
         server_version = "ssrf-obs"
 
@@ -295,18 +398,19 @@ def make_handler(db, registry):
             freq = int(freq) if freq and freq.isdigit() else None
             try:
                 if u.path == "/":
-                    self._send(200, render(db, registry),
+                    self._send(200, render(db, registry, index),
                                "text/html; charset=utf-8")
                 elif u.path == "/feed.json":
                     lim = q.get("limit", [DEFAULT_LIMIT])[0]
                     lim = int(lim) if str(lim).isdigit() else DEFAULT_LIMIT
-                    items = feed(db, lim, freq)
+                    items = feed(db, lim, freq, index)
                     self._json({"generated": time.time(),
                                 "count": len(items),
                                 "observations": items})
                 elif u.path == "/channels.json":
                     self._json({"%.4f MHz" % (f / 1e6): c
-                                for f, c in sorted(channels(db).items())})
+                                for f, c in sorted(
+                                    channels(db, index).items())})
                 elif u.path == "/stations.json":
                     self._json({"stations": stations(db, registry)})
                 elif u.path == "/beacons.json":
@@ -314,6 +418,9 @@ def make_handler(db, registry):
                                 "beacons": beacons(db)})
                 elif u.path == "/receivers.json":
                     self._json({"receivers": receivers(db)})
+                elif u.path == "/names.json":
+                    self._json({"enabled": index is not None,
+                                "index": index.status() if index else None})
                 elif u.path == "/healthz":
                     self._send(200, "ok\n", "text/plain")
                 else:
@@ -332,6 +439,8 @@ def serve(cfg, registry, db):
     web = cfg.get("web") or {}
     host = web.get("host", "0.0.0.0")
     port = int(web.get("port", 3100))
-    httpd = ThreadingHTTPServer((host, port), make_handler(db, registry))
+    index = names_mod.from_config(cfg)
+    httpd = ThreadingHTTPServer((host, port),
+                                make_handler(db, registry, index))
     log.info("observers page on http://%s:%d/", host, port)
     httpd.serve_forever()

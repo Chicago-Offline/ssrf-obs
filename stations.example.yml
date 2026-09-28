@@ -1,0 +1,5 @@
+# Manual enrollment only — small trusted set (NETWORK.md).
+# pubkey comes from: survey station-init
+bowmanville:
+  pubkey: "BASE64_ED25519_PUBLIC_KEY"
+  note: attic discone, 2x R820T2

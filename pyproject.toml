@@ -1,0 +1,16 @@
+[project]
+name = "ssrf-obs"
+version = "0.1.0"
+description = "Aggregator for rf-survey stations: verify signed observation batches, store append-only evidence, derive verification tiers for ssrf-lite"
+requires-python = ">=3.11"
+dependencies = ["PyYAML>=6.0", "paho-mqtt>=2.0", "cryptography>=41"]
+
+[project.scripts]
+ssrf-obs = "ssrfobs.cli:main"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["ssrfobs*"]

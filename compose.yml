@@ -1,0 +1,17 @@
+# ssrf-obs on the chicagooffline dev stack.
+# Joins chicagooffline-net and talks to the broker container directly —
+# no public listener, no token needed for the internal hop.
+services:
+  ssrf-obs:
+    build: .
+    container_name: ssrf-obs
+    restart: unless-stopped
+    volumes:
+      - ./data:/data
+    environment:
+      SSRF_OBS_CONFIG: /data/config.yml
+    networks: [chicagooffline-net]
+
+networks:
+  chicagooffline-net:
+    external: true

@@ -1,0 +1,11 @@
+db: /data/observations.db
+stations: /data/stations.yml
+client_id: ssrf-obs
+mqtt:
+  server: mosquitto        # container name on chicagooffline-net; or wsmqtt-dev host
+  port: 1883
+  transport: tcp
+  tls: false
+  # username: ssrf-obs
+  # password: via SSRF_OBS_MQTT_PASSWORD env
+  topic_prefix: rfsurvey

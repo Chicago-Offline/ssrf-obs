@@ -266,6 +266,57 @@ def receivers(db):
     return rows
 
 
+def _tone_claim(params):
+    """Human-readable published claim from merged param_state.
+
+    Shows what the catalog says the channel uses, not what we observed.
+    CTCSS -> "107.2 Hz", DCS -> "DCS 072", CC -> "CC 1", CSQ -> "CSQ",
+    nothing claimed -> dash.
+    """
+    if not params:
+        return '<span class="unk">&mdash;</span>'
+    parts = []
+    ctcss = params.get("ctcss_hz")
+    if ctcss:
+        obs = ctcss.get("observed")
+        if ctcss.get("state") == "no_claim":
+            # Catalog explicitly says CSQ (null expect)
+            parts.append("CSQ")
+        elif obs is not None:
+            parts.append("%.1f Hz" % obs)
+    dcs = params.get("dcs_code")
+    if dcs and dcs.get("state") != "no_claim":
+        obs = dcs.get("observed")
+        if obs:
+            parts.append("DCS %s" % str(obs).zfill(3))
+    cc = params.get("color_code")
+    if cc and cc.get("state") != "no_claim":
+        obs = cc.get("observed")
+        if obs is not None:
+            parts.append("CC %s" % obs)
+    return html.escape(", ".join(parts)) if parts else '<span class="unk">&mdash;</span>'
+
+
+def _tone_sort(params):
+    """Machine-sortable value for published tone/CC. CTCSS hz, else DCS 1000+,
+    else CC 2000+, else empty string (sorts last)."""
+    if not params:
+        return ""
+    ctcss = params.get("ctcss_hz")
+    if ctcss and ctcss.get("state") != "no_claim" and ctcss.get("observed"):
+        return ctcss["observed"]
+    dcs = params.get("dcs_code")
+    if dcs and dcs.get("state") != "no_claim" and dcs.get("observed"):
+        try:
+            return 1000 + int(dcs["observed"])
+        except (TypeError, ValueError):
+            return 1000
+    cc = params.get("color_code")
+    if cc and cc.get("state") != "no_claim" and cc.get("observed") is not None:
+        return 2000 + int(cc["observed"])
+    return ""
+
+
 def _ago(ts):
     if not ts:
         return "never"
@@ -330,6 +381,11 @@ PAGE = """<!doctype html>
  .filt button.on{{color:#0b0e11;background:#00E5FF;border-color:#00E5FF;
    font-weight:600}}
  .who{{color:#8fa3b0;font-size:12px}}
+ .monhdr{{display:flex;flex-wrap:wrap;gap:.5rem 1.5rem;font-size:12px;
+          color:#6d7f8b;margin:-.25rem 0 .75rem;align-items:center}}
+ .monhdr .pill{{display:inline-block;padding:0 .45rem;border-radius:3px;
+               color:#0b0e11;font-weight:600;font-size:11px}}
+ .tone{{color:#8fa3b0;font-size:12px}}
 </style>
 <h1>&#128225; CHICAGO OFFLINE &mdash; RF OBSERVERS</h1>
 <p class="sub">Signed survey evidence from enrolled receive stations.
@@ -342,18 +398,6 @@ PAGE = """<!doctype html>
  <a href="/receivers.json">/receivers.json</a> &middot;
  <a href="/names.json">/names.json</a>
  <br><span class="hint">Click any column heading to sort.</span></p>
-
-<div class="live">
-<h2><span class="dot{livedot}"></span>On the air &mdash; last {window} min
- <span class="n">{livecount}</span></h2>
-{active}
-</div>
-
-<h2>Observer stations</h2>
-{stations}
-
-<h2>Recent observations <span class="n">last {recentn}</span></h2>
-{recent}
 
 <h2>Channel monitoring <span class="n">{monitorn}</span></h2>
 <p class="sub">Catalog channels checked on a schedule whether or not the
@@ -368,8 +412,23 @@ PAGE = """<!doctype html>
  so. Hit rate is over checks actually performed, not over wall time: it
  answers &ldquo;when we listen, how often is it there&rdquo;, which is what
  a scan list cares about. Targets are fenced by distance, so a repeater
- nobody here could hear is absent rather than slandered as silent.</p>
+ nobody here could hear is absent rather than slandered as silent.
+ Published tone/CC shows the catalog claim; a dash means the catalog is
+ silent on that parameter.</p>
+{monhdr}
 {monitors}
+
+<div class="live">
+<h2><span class="dot{livedot}"></span>On the air &mdash; last {window} min
+ <span class="n">{livecount}</span></h2>
+{active}
+</div>
+
+<h2>Observer stations</h2>
+{stations}
+
+<h2>Recent observations <span class="n">last {recentn}</span></h2>
+{recent}
 
 <h2>Channel roll-up <span class="n">every frequency ever heard</span></h2>
 <p class="sub">The archive, not the live picture &mdash; one row per distinct
@@ -647,14 +706,28 @@ def render(db, registry, index=None):
                    '&mdash; run <code>survey beacon-check --serial '
                    '&lt;serial&gt;</code> on an observer</p>')
 
+    # Status sort order: active < stale < dormant < watching < never_heard
+    # Within same status: most recently heard first (None last).
+    _MON_ORDER = {"active": 0, "stale": 1, "dormant": 2,
+                  "watching": 3, "never_heard": 4}
+
     mons = monitors(db, index)
     if mons:
         rows = ""
         tally = {}
-        for _key, m in sorted(mons.items(),
-                              key=lambda kv: (kv[1]["freq_hz"] or 0,
-                                              kv[1]["target"] or "")):
+        last_checked_all = []
+        sorted_mons = sorted(
+            mons.items(),
+            key=lambda kv: (
+                _MON_ORDER.get(kv[1]["status"], 9),
+                -(kv[1]["last_heard"] or 0),
+                kv[1]["freq_hz"] or 0,
+            )
+        )
+        for _key, m in sorted_mons:
             tally[m["status"]] = tally.get(m["status"], 0) + 1
+            if m["last_checked"]:
+                last_checked_all.append(m["last_checked"])
             color = MON_BADGE.get(m["status"], "#888")
             mhz = (m["freq_hz"] or 0) / 1e6
             obs = m["observers"] or []
@@ -663,10 +736,17 @@ def render(db, registry, index=None):
             # listening. A silent row still has to name its observers or
             # "never heard" is an unattributable claim.
             who = ", ".join(heard_by or obs)
+            # Published tone/CC: pull from merged param_state.
+            # Show the catalog claim, not the observed value — this is
+            # "what does ssrf-lite say" so the reader can compare to
+            # what we actually verified.
+            tone_disp = _tone_claim(m.get("params") or {})
             rows += "<tr>" + "".join((
                 _td("%.4f MHz" % mhz, "%.6f" % mhz),
                 _td(html.escape(m["target"] or "-"), m["target"] or ""),
                 _td(html.escape(m["decoder"] or "-"), m["decoder"] or ""),
+                _td(tone_disp, _tone_sort(m.get("params") or {}),
+                    cls="tone"),
                 _td('<span class="b" style="background:%s">%s</span>'
                     % (color, m["status"].upper().replace("_", " ")),
                     m["status"]),
@@ -678,24 +758,53 @@ def render(db, registry, index=None):
                 _td(html.escape(who) or '<span class="unk">&mdash;</span>',
                     who, cls="who"),
             )) + "</tr>"
-        mon_html = _table(["frequency", "target", "mode", "status",
-                           "checks", "heard", "hit rate", "last heard",
-                           "last checked", "observers"],
+        mon_html = _table(["frequency", "target", "mode", "published tone/CC",
+                           "status", "checks", "heard", "hit rate",
+                           "last heard", "last checked", "observers"],
                           rows, tid="montable")
         mon_n = ", ".join("%d %s" % (n, s.replace("_", " "))
                           for s, n in sorted(tally.items(),
                                              key=lambda kv: (-kv[1], kv[0])))
+        # Monitoring health header: freshness + observer count.
+        n_observers = len({
+            o for _k, m in sorted_mons
+            for o in (m["observers"] or [])
+        })
+        if last_checked_all:
+            freshest = max(last_checked_all)
+            mon_hdr = ('<div class="monhdr">'
+                       '<span>%d channels watched</span>'
+                       '<span>last check <strong>%s</strong></span>'
+                       '<span>%d observer%s active</span>'
+                       '%s</div>' % (
+                           len(mons),
+                           _ago(freshest),
+                           n_observers,
+                           "" if n_observers == 1 else "s",
+                           " ".join(
+                               '<span class="pill" style="background:%s">'
+                               '%d %s</span>' % (
+                                   MON_BADGE.get(s, "#888"),
+                                   n, s.replace("_", " "))
+                               for s, n in sorted(
+                                   tally.items(),
+                                   key=lambda kv: _MON_ORDER.get(kv[0], 9))
+                           )
+                       ))
+        else:
+            mon_hdr = ""
     else:
         mon_html = ('<p class="empty">nothing monitored yet &mdash; add a '
                     "<code>monitor:</code> block with a "
                     "<code>targets_file</code> to an observer plan</p>")
         mon_n = "none"
+        mon_hdr = ""
 
     return PAGE.format(active=act_html, livecount=act_n, livedot=act_dot,
                        window=ACTIVE_WINDOW_S // 60,
                        stations=st_html, channels=ch_html, recent=rc_html,
                        recentn=len(items), monitors=mon_html, monitorn=mon_n,
-                       beacons=bc_html, script=SCRIPT,
+                       monhdr=mon_hdr, beacons=bc_html, script=SCRIPT,
                        now=time.strftime("%Y-%m-%d %H:%M:%SZ", time.gmtime()))
 
 

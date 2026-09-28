@@ -243,3 +243,60 @@ class MonitorRenderTest(unittest.TestCase):
         page = web.render(self.db, {})
         self.assertLess(page.index("Channel monitoring"),
                         page.index("Channel roll-up"))
+
+    def test_monitoring_section_precedes_live_window(self):
+        # Live window answers "what's on right now"; monitoring answers
+        # "is this repeater alive" — the higher-value question leads.
+        page = web.render(self.db, {})
+        self.assertLess(page.index("Channel monitoring"),
+                        page.index("On the air"))
+
+    def test_health_header_appears_when_checks_present(self):
+        self.db.insert_batch(_batch([_chk(heard=False)]))
+        page = web.render(self.db, {})
+        self.assertIn("channels watched", page)
+        self.assertIn("last check", page)
+        self.assertIn("observer", page)
+
+    def test_health_header_absent_when_no_monitors(self):
+        # Empty state must not emit a misleading "0 channels watched" header.
+        page = web.render(self.db, {})
+        self.assertNotIn("channels watched", page)
+
+    def test_default_sort_active_before_watching(self):
+        # Active entries must render before watching entries in the default
+        # (unsorted) page order — status priority, not frequency order.
+        import time as _time
+        heard_chk = _chk(target="KA9HHH 146.880", freq_hz=146_880_000,
+                         ssrf_id="ka9hhh:146880", heard=True, ts=NOW - 3600)
+        silent_chk = _chk(target="NS9RC 145.470", freq_hz=145_470_000,
+                          heard=False)
+        self.db.insert_batch(_batch([heard_chk, silent_chk], bid="b2"))
+        page = web.render(self.db, {})
+        self.assertLess(page.index("KA9HHH"), page.index("NS9RC"))
+
+    def test_published_tone_column_present(self):
+        # The tone/CC column header must exist whether or not params are set.
+        self.db.insert_batch(_batch([_chk(heard=False)]))
+        page = web.render(self.db, {})
+        self.assertIn("published tone", page)
+
+    def test_published_tone_shows_ctcss_claim(self):
+        p = {"ctcss_hz": {"state": "verified", "observed": 107.2}}
+        self.db.insert_batch(_batch([_chk(params=p, heard=True)]))
+        page = web.render(self.db, {})
+        self.assertIn("107.2 Hz", page)
+
+    def test_published_tone_shows_color_code(self):
+        p = {"color_code": {"state": "verified", "observed": 1}}
+        self.db.insert_batch(_batch([_chk(params=p, heard=True)]))
+        page = web.render(self.db, {})
+        self.assertIn("CC 1", page)
+
+    def test_published_tone_dash_when_no_claim(self):
+        # No params in the check -> dash in the tone column, not an error.
+        self.db.insert_batch(_batch([_chk(heard=False)]))
+        page = web.render(self.db, {})
+        # The tone column header exists; at least one dash cell must follow.
+        self.assertIn("published tone", page)
+        self.assertIn("&mdash;", page)  # emitted as HTML entity

@@ -4,7 +4,8 @@ Stdlib http.server on purpose: the evidence DB is append-only and this
 surface never writes, so an extra web framework would buy nothing.
 
 Routes:
-  /              HTML observers page (stations + graded channels)
+  /              HTML observers page (live window first, then the archive)
+  /active.json   channels heard inside the live window, newest first
   /feed.json     recent observations, newest first (?limit=, ?freq=)
   /channels.json per-channel verification rollup (same data as `report`)
   /stations.json enrolled stations + last-heard
@@ -25,6 +26,11 @@ log = logging.getLogger(__name__)
 
 MAX_LIMIT = 500
 DEFAULT_LIMIT = 100
+
+# How far back "on the air right now" reaches. Short on purpose: this is the
+# only part of the page that answers "is anything happening", and a window
+# wide enough to always look busy would stop answering that question.
+ACTIVE_WINDOW_S = 900
 
 
 def identify(index, freq_hz):
@@ -111,14 +117,23 @@ def stations(db, registry):
             for sid in sorted(registry)]
 
 
-def feed(db, limit=DEFAULT_LIMIT, freq_hz=None, index=None):
-    """Recent observations, newest first."""
+def feed(db, limit=DEFAULT_LIMIT, freq_hz=None, index=None, since=None):
+    """Recent observations, newest first.
+
+    since is an epoch floor, so a caller asking "what happened in the last
+    N seconds" gets a real time query instead of guessing at a row limit.
+    """
     q = ("SELECT station_id, ts, receiver, freq_hz, snr_db, duration_s,"
          " decoder, gated, meta FROM observations")
-    args = []
+    where, args = [], []
     if freq_hz:
-        q += " WHERE freq_hz=?"
+        where.append("freq_hz=?")
         args.append(freq_hz)
+    if since is not None:
+        where.append("ts>=?")
+        args.append(since)
+    if where:
+        q += " WHERE " + " AND ".join(where)
     q += " ORDER BY ts DESC LIMIT ?"
     args.append(min(int(limit), MAX_LIMIT))
     items = []
@@ -136,6 +151,44 @@ def feed(db, limit=DEFAULT_LIMIT, freq_hz=None, index=None):
              "meta": m},
             identify(index, f) if snapped(m) else None))
     return items
+
+
+def active(db, window_s=ACTIVE_WINDOW_S, index=None):
+    """Channels heard inside the live window, collapsed one row per channel.
+
+    The archive already answers "what have we ever heard". This answers the
+    question a visitor actually arrives with -- what is on the air now --
+    and it keeps the observer set per channel, because the same channel
+    heard by two observers inside one window is the first hint of a
+    corroborated hit rather than one receiver's local artifact.
+    """
+    rows = feed(db, limit=MAX_LIMIT, index=index,
+                since=time.time() - window_s)
+    out = {}
+    for o in rows:
+        cur = out.get(o["freq_hz"])
+        if cur is None:
+            out[o["freq_hz"]] = dict(o, hits=1,
+                                     observers=[o["station_id"]],
+                                     best_snr=o["snr_db"])
+            continue
+        cur["hits"] += 1
+        if o["station_id"] not in cur["observers"]:
+            cur["observers"].append(o["station_id"])
+        if o["snr_db"] is not None and (cur["best_snr"] is None
+                                        or o["snr_db"] > cur["best_snr"]):
+            cur["best_snr"] = o["snr_db"]
+    items = sorted(out.values(), key=lambda r: r["ts"], reverse=True)
+    for r in items:
+        r["observers"].sort()
+    return items
+
+
+def last_observation_ts(db):
+    """Newest observation timestamp, or None. Used for the quiet-window note
+    so an empty live table can say how quiet, not just that it is empty."""
+    row = db.db.execute("SELECT MAX(ts) FROM observations").fetchone()
+    return row[0] if row and row[0] is not None else None
 
 
 # Drift/status thresholds for the beacon badge. A reading itself never
@@ -199,16 +252,18 @@ def _ago(ts):
 BADGE = {"verified": "#39FF14", "observed": "#00E5FF",
          "flagged": "#FFB300", "stale": "#888"}
 
+
 PAGE = """<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Chicago Offline - RF Observers</title>
 <style>
  body{{background:#0b0e11;color:#d7e0e6;font:14px/1.5 ui-monospace,Menlo,monospace;
-      margin:0;padding:2rem 1.25rem;max-width:60rem;margin-inline:auto}}
+      margin:0;padding:2rem 1.25rem;max-width:64rem;margin-inline:auto}}
  h1{{color:#00E5FF;font-size:1.3rem;letter-spacing:.06em;margin:0 0 .25rem}}
  h2{{color:#00E5FF;font-size:.95rem;letter-spacing:.08em;text-transform:uppercase;
      margin:2rem 0 .6rem;border-bottom:1px solid #1d262e;padding-bottom:.35rem}}
+ h2 .n{{color:#42525c;font-weight:400;letter-spacing:0;text-transform:none}}
  .sub{{color:#6d7f8b;margin:0 0 1rem}}
  table{{border-collapse:collapse;width:100%;font-size:13px}}
  th{{text-align:left;color:#6d7f8b;font-weight:500;padding:.35rem .6rem .35rem 0;
@@ -222,31 +277,60 @@ PAGE = """<!doctype html>
  .hint{{color:#6d7f8b;font-size:11px}}
  .unk{{color:#42525c}}
  footer{{color:#42525c;margin-top:2.5rem;font-size:12px}}
+ th.sx{{cursor:pointer;user-select:none;white-space:nowrap}}
+ th.sx:hover{{color:#00E5FF}}
+ th.sx::after{{content:"\\2195";opacity:.3;margin-left:.3rem;font-size:10px}}
+ th.asc::after{{content:"\\2191";opacity:1;color:#00E5FF}}
+ th.desc::after{{content:"\\2193";opacity:1;color:#00E5FF}}
+ .live{{border:1px solid #14323a;background:#0d1519;border-radius:6px;
+        padding:.8rem .9rem}}
+ .live h2{{margin-top:0}}
+ .dot{{display:inline-block;width:.5rem;height:.5rem;border-radius:50%;
+       background:#39FF14;margin-right:.45rem;vertical-align:middle}}
+ .dot.off{{background:#42525c}}
+ .filt{{margin:0 0 .6rem}}
+ .filt button{{background:#111a20;color:#6d7f8b;border:1px solid #1d262e;
+   border-radius:3px;font:inherit;font-size:11px;padding:.15rem .55rem;
+   margin-right:.3rem;cursor:pointer}}
+ .filt button.on{{color:#0b0e11;background:#00E5FF;border-color:#00E5FF;
+   font-weight:600}}
+ .who{{color:#8fa3b0;font-size:12px}}
 </style>
 <h1>&#128225; CHICAGO OFFLINE &mdash; RF OBSERVERS</h1>
 <p class="sub">Signed survey evidence from enrolled receive stations.
- Feed: <a href="/feed.json">/feed.json</a> &middot;
+ Feed: <a href="/active.json">/active.json</a> &middot;
+ <a href="/feed.json">/feed.json</a> &middot;
  <a href="/channels.json">/channels.json</a> &middot;
  <a href="/stations.json">/stations.json</a> &middot;
  <a href="/beacons.json">/beacons.json</a> &middot;
  <a href="/receivers.json">/receivers.json</a> &middot;
- <a href="/names.json">/names.json</a></p>
+ <a href="/names.json">/names.json</a>
+ <br><span class="hint">Click any column heading to sort.</span></p>
 
-<h2>Stations</h2>
+<div class="live">
+<h2><span class="dot{livedot}"></span>On the air &mdash; last {window} min
+ <span class="n">{livecount}</span></h2>
+{active}
+</div>
+
+<h2>Observer stations</h2>
 {stations}
 
-<h2>Channels</h2>
-<p class="sub">Station / system names are matched by frequency against the
- curated <a href="https://chicago-offline.github.io/ssrf-lite/">ssrf-lite</a>
- channel index. They say who is <em>known to use</em> the channel &mdash; not
- who was identified on the air, which is what the tier column is for.
- <span class="hint">(input)</span> = matched a repeater's input side.
- <span class="hint">(near)</span> = off-raster, matched inside the tolerance
- window. <span class="unk">&mdash;</span> = no entry in ssrf-lite yet.</p>
-{channels}
-
-<h2>Recent observations</h2>
+<h2>Recent observations <span class="n">last {recentn}</span></h2>
 {recent}
+
+<h2>Channel roll-up <span class="n">every frequency ever heard</span></h2>
+<p class="sub">The archive, not the live picture &mdash; one row per distinct
+ frequency across the whole append-only DB, which is why it is long. Its job
+ is to show <em>coverage gaps</em>: a resolved channel with no name is a
+ missing <a href="https://chicago-offline.github.io/ssrf-lite/">ssrf-lite</a>
+ entry worth filing. <span class="hint">(input)</span> = matched a repeater's
+ input side. <span class="hint">(near)</span> = off-raster, matched inside the
+ tolerance window. <span class="unk">&mdash;</span> = no entry in ssrf-lite
+ yet. <span class="hint">(unresolved)</span> rows are sweep artifacts, not
+ channels &mdash; the bin was too wide to identify one channel, so they are
+ hidden by default.</p>
+{channels}
 
 <h2>Beacon calibration</h2>
 <p class="sub">Reference emitters (NETWORK.md &sect;7) bound
@@ -259,7 +343,96 @@ PAGE = """<!doctype html>
 
 <footer>ssrf-obs &middot; append-only evidence &middot; tiers V0 heard /
  V1 decoded / V2 voice / V3 recorded &middot; generated {now}</footer>
+{script}
 """
+
+# Vanilla JS on purpose: the server is stdlib http.server and the page is
+# a few hundred rows. Sorting reads td[data-v] so "3h ago" sorts by epoch
+# and "460.1250" sorts as a number, not as text.
+SCRIPT = """<script>
+(function(){
+ function key(td){
+  if(!td){return '';}
+  var v=td.getAttribute('data-v');
+  if(v!==null){var f=parseFloat(v);return (v!==''&&!isNaN(f))?f:v;}
+  var s=(td.textContent||'').trim(),g=parseFloat(s);
+  return (!isNaN(g)&&/^[-+.0-9]/.test(s))?g:s;
+ }
+ function blank(x){return x===''||x==='-'||x==='\\u2014';}
+ function sortable(t){
+  var hd=t.tHead&&t.tHead.rows[0];
+  if(!hd||!t.tBodies.length){return;}
+  Array.prototype.forEach.call(hd.cells,function(th,i){
+   function go(){
+    var dir=th.getAttribute('data-dir')==='a'?'d':'a';
+    Array.prototype.forEach.call(hd.cells,function(o){
+     o.removeAttribute('data-dir');o.classList.remove('asc','desc');});
+    th.setAttribute('data-dir',dir);
+    th.classList.add(dir==='a'?'asc':'desc');
+    var tb=t.tBodies[0],rows=Array.prototype.slice.call(tb.rows);
+    rows.sort(function(a,b){
+     var x=key(a.cells[i]),y=key(b.cells[i]);
+     if(blank(x)&&blank(y)){return 0;}
+     if(blank(x)){return 1;}
+     if(blank(y)){return -1;}
+     var c=(typeof x==='number'&&typeof y==='number')?(x-y):
+       String(x).localeCompare(String(y),undefined,{numeric:true});
+     return dir==='a'?c:-c;});
+    rows.forEach(function(r){tb.appendChild(r);});
+   }
+   th.addEventListener('click',go);
+   th.addEventListener('keydown',function(e){
+    if(e.key==='Enter'||e.key===' '){e.preventDefault();go();}});
+  });
+ }
+ Array.prototype.forEach.call(
+  document.querySelectorAll('table.s'),sortable);
+
+ var box=document.getElementById('chfilter'),
+     tbl=document.getElementById('chtable');
+ if(box&&tbl){
+  var btns=box.getElementsByTagName('button');
+  function apply(mode){
+   Array.prototype.forEach.call(tbl.tBodies[0].rows,function(r){
+    var ok=(mode==='all')||
+           (mode==='named'&&r.getAttribute('data-named')==='1')||
+           (mode==='res'&&r.getAttribute('data-res')==='1');
+    r.style.display=ok?'':'none';});
+   Array.prototype.forEach.call(btns,function(b){
+    if(b.getAttribute('data-m')===mode){b.classList.add('on');}
+    else{b.classList.remove('on');}});
+   try{localStorage.setItem('chmode',mode);}catch(e){}
+  }
+  Array.prototype.forEach.call(btns,function(b){
+   b.addEventListener('click',function(){
+    apply(b.getAttribute('data-m'));});});
+  var saved=null;
+  try{saved=localStorage.getItem('chmode');}catch(e){}
+  apply(saved||'res');
+ }
+})();
+</script>"""
+
+
+def _td(disp, sort=None, cls=None):
+    """One cell. sort is the machine-sortable value behind the display text
+    (epoch behind "3h ago", float behind "460.1250 MHz")."""
+    a = ""
+    if cls:
+        a += ' class="%s"' % cls
+    if sort is not None:
+        a += ' data-v="%s"' % html.escape(str(sort), quote=True)
+    return "<td%s>%s</td>" % (a, disp)
+
+
+def _table(cols, rows, tid=None):
+    head = "".join('<th class="sx" tabindex="0">%s</th>' % c for c in cols)
+    return ('<table class="s"%s><thead><tr>%s</tr></thead><tbody>%s</tbody>'
+            "</table>" % (' id="%s"' % tid if tid else "", head, rows))
+
+
+def _fnum(v, fmt="%.1f", dash="-"):
+    return dash if v is None else fmt % v
 
 
 def _ident_cell(row):
@@ -269,13 +442,13 @@ def _ident_cell(row):
         if row.get("channel_snap") is False:
             # Not "we don't know who" but "the sweep couldn't resolve a
             # channel here", which is a different (and fixable) problem.
-            return ('<td class="unk">&mdash; <span class="hint"'
+            return ('<td data-v="" class="unk">&mdash; <span class="hint"'
                     ' title="rf-survey could not snap this hit to a channel'
                     ' raster point, so the frequency is a bin centre rather'
                     ' than a channel. Needs a narrower sweep bin or a'
                     ' refined dwell before it can be named.">'
                     '(unresolved)</span></td>')
-        return '<td class="unk">&mdash;</td>'
+        return '<td data-v="" class="unk">&mdash;</td>'
     extra = []
     call = row.get("callsign")
     if call and call != name:
@@ -291,37 +464,86 @@ def _ident_cell(row):
     if extra:
         cell += ' <span class="hint">(%s)</span>' % html.escape(
             ", ".join(extra))
-    return "<td>%s</td>" % cell
+    return '<td data-v="%s">%s</td>' % (html.escape(name, quote=True), cell)
+
+
+
+def _active_html(db, index):
+    """Live window table + an empty state that says how quiet it is."""
+    act = active(db, index=index)
+    if not act:
+        last = last_observation_ts(db)
+        if last is None:
+            return ('<p class="empty">no observations yet &mdash; stations '
+                    'are enrolled but nothing has been reported</p>'), "", " off"
+        return ('<p class="empty">nothing on the air in the last %d min '
+                '&mdash; most recent hit was %s</p>'
+                % (ACTIVE_WINDOW_S // 60, _ago(last))), "", " off"
+    rows = ""
+    for o in act:
+        who = ", ".join(o["observers"])
+        rows += "<tr>" + "".join((
+            _td(_ago(o["ts"]), o["ts"]),
+            _td(_fnum(o["freq_mhz"], "%.4f"), o["freq_mhz"] or ""),
+            _ident_cell(o),
+            _td(html.escape(who), who, cls="who"),
+            _td(o["level"] or "-", o["level"] or "", cls="lvl"),
+            _td(_fnum(o["best_snr"]),
+                "" if o["best_snr"] is None else o["best_snr"]),
+            _td(o["hits"], o["hits"]),
+        )) + "</tr>"
+    tbl = _table(["when", "MHz", "station / system", "heard by", "tier",
+                  "best SNR", "hits"], rows)
+    n = "%d channel%s" % (len(act), "" if len(act) == 1 else "s")
+    return tbl, n, ""
 
 
 def render(db, registry, index=None):
+    act_html, act_n, act_dot = _active_html(db, index)
+
     sts = stations(db, registry)
     if sts:
-        rows = "".join(
-            "<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>" % (
-                html.escape(s["station_id"]), _ago(s["last_batch"]),
-                s["observations"], s["sweep_bins"])
-            for s in sts)
-        st_html = ("<table><tr><th>station<th>last batch<th>obs"
-                   "<th>sweep bins</tr>" + rows + "</table>")
+        rows = ""
+        for s in sts:
+            rows += "<tr>" + "".join((
+                _td(html.escape(s["station_id"]), s["station_id"]),
+                _td(_ago(s["last_batch"]), s["last_batch"] or ""),
+                _td(s["observations"], s["observations"]),
+                _td(s["sweep_bins"], s["sweep_bins"]),
+            )) + "</tr>"
+        st_html = _table(["station", "last batch", "obs", "sweep bins"], rows)
     else:
         st_html = '<p class="empty">no stations enrolled</p>'
 
     ch = channels(db, index)
     if ch:
         rows = ""
+        n_named = n_res = 0
         for f, c in sorted(ch.items()):
+            named = 1 if c.get("name") else 0
+            res = 1 if c.get("channel_snap") else 0
+            n_named += named
+            n_res += res
             color = BADGE.get(c["status"], "#888")
-            rows += (
-                '<tr><td>%.4f MHz</td>%s<td class="lvl">%s</td>'
-                '<td><span class="b" style="background:%s">%s</span></td>'
-                '<td>%s</td><td>%s</td></tr>' % (
-                    f / 1e6, _ident_cell(c), c["level"], color,
-                    c["status"].upper(),
-                    _ago(c["last_heard"]), c["v1_stations"]))
-        ch_html = ("<table><tr><th>frequency<th>station / system<th>tier"
-                   "<th>status<th>last heard<th>V1 stations</tr>"
-                   + rows + "</table>")
+            mhz = f / 1e6
+            rows += '<tr data-named="%d" data-res="%d">' % (named, res)
+            rows += "".join((
+                _td("%.4f MHz" % mhz, "%.6f" % mhz),
+                _ident_cell(c),
+                _td(c["level"], c["level"], cls="lvl"),
+                _td('<span class="b" style="background:%s">%s</span>'
+                    % (color, c["status"].upper()), c["status"]),
+                _td(_ago(c["last_heard"]), c["last_heard"] or ""),
+                _td(c["v1_stations"], c["v1_stations"]),
+            )) + "</tr>"
+        filt = ('<div class="filt" id="chfilter">'
+                '<button data-m="res">resolved channels (%d)</button>'
+                '<button data-m="named">named in ssrf-lite (%d)</button>'
+                '<button data-m="all">everything (%d)</button></div>'
+                % (n_res, n_named, len(ch)))
+        ch_html = filt + _table(
+            ["frequency", "station / system", "tier", "status", "last heard",
+             "V1 stations"], rows, tid="chtable")
     else:
         ch_html = ('<p class="empty">no graded channels yet &mdash; '
                    'stations are sweeping, nothing has tripped the dwell gate'
@@ -329,19 +551,21 @@ def render(db, registry, index=None):
 
     items = feed(db, limit=25, index=index)
     if items:
-        rows = "".join(
-            "<tr><td>%s</td><td>%s</td><td>%s</td>%s<td>%s</td>"
-            '<td class="lvl">%s</td><td>%s</td></tr>' % (
-                _ago(o["ts"]), html.escape(o["station_id"]),
-                "%.4f" % o["freq_mhz"] if o["freq_mhz"] else "?",
+        rows = ""
+        for o in items:
+            rows += "<tr>" + "".join((
+                _td(_ago(o["ts"]), o["ts"]),
+                _td(html.escape(o["station_id"]), o["station_id"]),
+                _td("%.4f" % o["freq_mhz"] if o["freq_mhz"] else "?",
+                    o["freq_mhz"] or ""),
                 _ident_cell(o),
-                html.escape(o["decoder"] or "-"),
-                o["level"] or "-",
-                "%.1f" % o["snr_db"] if o["snr_db"] is not None else "-")
-            for o in items)
-        rc_html = ("<table><tr><th>when<th>observer<th>MHz"
-                   "<th>station / system<th>decoder<th>tier<th>SNR dB</tr>"
-                   + rows + "</table>")
+                _td(html.escape(o["decoder"] or "-"), o["decoder"] or ""),
+                _td(o["level"] or "-", o["level"] or "", cls="lvl"),
+                _td(_fnum(o["snr_db"]),
+                    "" if o["snr_db"] is None else o["snr_db"]),
+            )) + "</tr>"
+        rc_html = _table(["when", "observer", "MHz", "station / system",
+                          "decoder", "tier", "SNR dB"], rows)
     else:
         rc_html = '<p class="empty">no observations yet</p>'
 
@@ -351,26 +575,30 @@ def render(db, registry, index=None):
         for b in sorted(bl, key=lambda x: (x["station_id"], x["receiver"],
                                            x["freq_hz"])):
             color = BADGE.get(b["badge"], "#888")
-            snr = "%.1f" % b["snr_db"] if b["snr_db"] is not None else "-"
-            drift = ("%+.1f" % b["drift_db"]) if b["drift_db"] is not None \
-                else "n/a"
-            rows += (
-                "<tr><td>%s</td><td>%s</td><td>%s</td><td>%.4f</td>"
-                '<td><span class="b" style="background:%s">%s</span></td>'
-                "<td>%s</td><td>%s</td><td>%s</td></tr>" % (
-                    html.escape(b["station_id"]), html.escape(b["receiver"]),
-                    html.escape(b["ref_id"]), b["freq_hz"] / 1e6,
-                    color, b["badge"].upper(), snr, drift, _ago(b["ts"])))
-        bc_html = ("<table><tr><th>station<th>receiver<th>reference"
-                   "<th>MHz<th>status<th>SNR dB<th>drift<th>last reading"
-                   "</tr>" + rows + "</table>")
+            rows += "<tr>" + "".join((
+                _td(html.escape(b["station_id"]), b["station_id"]),
+                _td(html.escape(b["receiver"]), b["receiver"]),
+                _td(html.escape(b["ref_id"]), b["ref_id"]),
+                _td("%.4f" % (b["freq_hz"] / 1e6), b["freq_hz"]),
+                _td('<span class="b" style="background:%s">%s</span>'
+                    % (color, b["badge"].upper()), b["badge"]),
+                _td(_fnum(b["snr_db"]),
+                    "" if b["snr_db"] is None else b["snr_db"]),
+                _td(_fnum(b["drift_db"], "%+.1f", "n/a"),
+                    "" if b["drift_db"] is None else b["drift_db"]),
+                _td(_ago(b["ts"]), b["ts"]),
+            )) + "</tr>"
+        bc_html = _table(["station", "receiver", "reference", "MHz", "status",
+                          "SNR dB", "drift", "last reading"], rows)
     else:
         bc_html = ('<p class="empty">no beacon-check runs reported yet '
                    '&mdash; run <code>survey beacon-check --serial '
                    '&lt;serial&gt;</code> on an observer</p>')
 
-    return PAGE.format(stations=st_html, channels=ch_html, recent=rc_html,
-                       beacons=bc_html,
+    return PAGE.format(active=act_html, livecount=act_n, livedot=act_dot,
+                       window=ACTIVE_WINDOW_S // 60,
+                       stations=st_html, channels=ch_html, recent=rc_html,
+                       recentn=len(items), beacons=bc_html, script=SCRIPT,
                        now=time.strftime("%Y-%m-%d %H:%M:%SZ", time.gmtime()))
 
 
@@ -400,6 +628,14 @@ def make_handler(db, registry, index=None):
                 if u.path == "/":
                     self._send(200, render(db, registry, index),
                                "text/html; charset=utf-8")
+                elif u.path == "/active.json":
+                    w = q.get("window", [ACTIVE_WINDOW_S])[0]
+                    w = int(w) if str(w).isdigit() else ACTIVE_WINDOW_S
+                    items = active(db, w, index)
+                    self._json({"generated": time.time(),
+                                "window_s": w,
+                                "count": len(items),
+                                "channels": items})
                 elif u.path == "/feed.json":
                     lim = q.get("limit", [DEFAULT_LIMIT])[0]
                     lim = int(lim) if str(lim).isdigit() else DEFAULT_LIMIT
@@ -444,3 +680,4 @@ def serve(cfg, registry, db):
                                 make_handler(db, registry, index))
     log.info("observers page on http://%s:%d/", host, port)
     httpd.serve_forever()
+

@@ -81,6 +81,54 @@ def feed(db, limit=DEFAULT_LIMIT, freq_hz=None):
     return items
 
 
+# Drift/status thresholds for the beacon badge. A reading itself never
+# claims "healthy" beyond calibration.SNR is the metric: it survives a
+# gain change, which absolute dB does not (rf-survey NETWORK.md S7).
+STALE_S = 3 * 3600          # no reading this recent -> can't vouch for now
+NOT_HEARD_DROP_DB = 6.0     # not_heard after being ok -> flag, don't hide
+
+
+def beacons(db):
+    """Latest beacon reading per (station_id, receiver, ref_id), with a
+    same-observer SNR history for a simple drift figure. No cross-observer
+    averaging -- an observer is graded only against its own history
+    (NETWORK.md S7: baselines are per observer, band-local, multi-day).
+    """
+    latest = db.beacon_latest()
+    hist = {}
+    for row in db.db.execute(
+            "SELECT station_id,receiver,ref_id,snr_db,ts FROM beacon_readings"
+            " WHERE status='ok' AND pinned=1 AND ts>=?"
+            " ORDER BY ts DESC", (time.time() - 7 * 86400,)).fetchall():
+        hist.setdefault(row[:3], []).append(row[3])
+
+    out = []
+    for r in latest:
+        key = (r["station_id"], r["receiver"], r["ref_id"])
+        samples = hist.get(key, [])
+        drift_db = None
+        if r["status"] == "ok" and len(samples) >= 5:
+            baseline = sorted(samples[1:])[len(samples[1:]) // 2]
+            drift_db = round(samples[0] - baseline, 1)
+        age_s = time.time() - r["ts"]
+        badge = "stale" if age_s > STALE_S else {
+            "ok": "verified", "not_heard": "flagged",
+            "no_reference": "stale", "error": "flagged",
+        }.get(r["status"], "stale")
+        if r["coverage"] == "unverified" and badge == "verified":
+            badge = "observed"  # measured, but antenna undeclared -> unscoreable
+        out.append(dict(r, age_s=age_s, drift_db=drift_db, badge=badge))
+    return out
+
+
+def receivers(db):
+    rows = db.receiver_rows()
+    for r in rows:
+        r["antenna"] = json.loads(r["antenna"]) if r.get("antenna") else None
+        r["placement"] = json.loads(r["placement"]) if r.get("placement") else None
+    return rows
+
+
 def _ago(ts):
     if not ts:
         return "never"
@@ -120,7 +168,9 @@ PAGE = """<!doctype html>
 <p class="sub">Signed survey evidence from enrolled receive stations.
  Feed: <a href="/feed.json">/feed.json</a> &middot;
  <a href="/channels.json">/channels.json</a> &middot;
- <a href="/stations.json">/stations.json</a></p>
+ <a href="/stations.json">/stations.json</a> &middot;
+ <a href="/beacons.json">/beacons.json</a> &middot;
+ <a href="/receivers.json">/receivers.json</a></p>
 
 <h2>Stations</h2>
 {stations}
@@ -130,6 +180,15 @@ PAGE = """<!doctype html>
 
 <h2>Recent observations</h2>
 {recent}
+
+<h2>Beacon calibration</h2>
+<p class="sub">Reference emitters (NETWORK.md &sect;7) bound
+ <em>hardware</em> variance per observer &mdash; dead dongle, wet feedline,
+ moved antenna, drifting gain. Never propagation, never evidence about a
+ surveyed channel. <code>no_reference</code> = outside this observer's
+ declared antenna reach, correctly excluded, not hidden.
+ <code>unverified</code> = antenna undeclared; measured, can't be scored.</p>
+{beacons}
 
 <footer>ssrf-obs &middot; append-only evidence &middot; tiers V0 heard /
  V1 decoded / V2 voice / V3 recorded &middot; generated {now}</footer>
@@ -183,7 +242,32 @@ def render(db, registry):
     else:
         rc_html = '<p class="empty">no observations yet</p>'
 
+    bl = beacons(db)
+    if bl:
+        rows = ""
+        for b in sorted(bl, key=lambda x: (x["station_id"], x["receiver"],
+                                           x["freq_hz"])):
+            color = BADGE.get(b["badge"], "#888")
+            snr = "%.1f" % b["snr_db"] if b["snr_db"] is not None else "-"
+            drift = ("%+.1f" % b["drift_db"]) if b["drift_db"] is not None \
+                else "n/a"
+            rows += (
+                "<tr><td>%s</td><td>%s</td><td>%s</td><td>%.4f</td>"
+                '<td><span class="b" style="background:%s">%s</span></td>'
+                "<td>%s</td><td>%s</td><td>%s</td></tr>" % (
+                    html.escape(b["station_id"]), html.escape(b["receiver"]),
+                    html.escape(b["ref_id"]), b["freq_hz"] / 1e6,
+                    color, b["badge"].upper(), snr, drift, _ago(b["ts"])))
+        bc_html = ("<table><tr><th>station<th>receiver<th>reference"
+                   "<th>MHz<th>status<th>SNR dB<th>drift<th>last reading"
+                   "</tr>" + rows + "</table>")
+    else:
+        bc_html = ('<p class="empty">no beacon-check runs reported yet '
+                   '&mdash; run <code>survey beacon-check --serial '
+                   '&lt;serial&gt;</code> on an observer</p>')
+
     return PAGE.format(stations=st_html, channels=ch_html, recent=rc_html,
+                       beacons=bc_html,
                        now=time.strftime("%Y-%m-%d %H:%M:%SZ", time.gmtime()))
 
 
@@ -225,6 +309,11 @@ def make_handler(db, registry):
                                 for f, c in sorted(channels(db).items())})
                 elif u.path == "/stations.json":
                     self._json({"stations": stations(db, registry)})
+                elif u.path == "/beacons.json":
+                    self._json({"generated": time.time(),
+                                "beacons": beacons(db)})
+                elif u.path == "/receivers.json":
+                    self._json({"receivers": receivers(db)})
                 elif u.path == "/healthz":
                     self._send(200, "ok\n", "text/plain")
                 else:

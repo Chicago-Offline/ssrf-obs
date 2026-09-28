@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import sys
+import threading
 
 import yaml
 
@@ -23,10 +24,24 @@ def load_cfg(path):
 def cmd_run(args, cfg):
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s")
-    from . import service
+    from . import service, web
     reg = registry_mod.load(cfg["stations"])
     logging.info("registry: %d station(s): %s", len(reg), ", ".join(sorted(reg)))
-    service.run(cfg, reg, DB(cfg["db"]))
+    db = DB(cfg["db"])
+    if (cfg.get("web") or {}).get("enabled", True):
+        threading.Thread(target=web.serve, args=(cfg, reg, db),
+                         daemon=True, name="web").start()
+    service.run(cfg, reg, db)
+    return 0
+
+
+def cmd_serve(args, cfg):
+    """Web surface only -- no MQTT subscriber."""
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s %(levelname)s %(message)s")
+    from . import web
+    reg = registry_mod.load(cfg["stations"])
+    web.serve(cfg, reg, DB(cfg["db"]))
     return 0
 
 
@@ -49,11 +64,13 @@ def main(argv=None):
         description="rf-survey aggregator: verify, store, grade evidence")
     p.add_argument("--config", default=DEFAULT_CONFIG)
     sub = p.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("run", help="subscribe and ingest forever")
+    sub.add_parser("run", help="subscribe and ingest forever (+ web)")
     sub.add_parser("report", help="per-channel verification rollup")
+    sub.add_parser("serve", help="observers page + JSON feed only")
     args = p.parse_args(argv)
     cfg = load_cfg(args.config)
-    return {"run": cmd_run, "report": cmd_report}[args.cmd](args, cfg)
+    return {"run": cmd_run, "report": cmd_report,
+            "serve": cmd_serve}[args.cmd](args, cfg)
 
 
 if __name__ == "__main__":

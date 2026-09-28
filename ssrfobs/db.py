@@ -31,6 +31,37 @@ CREATE TABLE IF NOT EXISTS observations (
 );
 CREATE INDEX IF NOT EXISTS obs_freq ON observations(freq_hz);
 CREATE INDEX IF NOT EXISTS obs_station ON observations(station_id);
+
+-- Observer descriptors (rf-survey NETWORK.md S1): additive `receivers`
+-- block from the batch. Upserted per (station_id, receiver) — latest
+-- descriptor wins, since antenna/placement is current state, not history.
+CREATE TABLE IF NOT EXISTS receivers (
+  station_id TEXT NOT NULL,
+  receiver TEXT NOT NULL,
+  role TEXT, gain REAL, antenna TEXT, placement TEXT,
+  updated_at REAL NOT NULL,
+  PRIMARY KEY (station_id, receiver)
+);
+
+-- Beacon calibration readings (rf-survey NETWORK.md S7). Keyed by OBSERVER
+-- (station_id, receiver), never by station alone — two dongles on one
+-- host can carry different antennas and averaging them would smear
+-- exactly the hardware variance these readings exist to catch.
+CREATE TABLE IF NOT EXISTS beacon_readings (
+  id INTEGER PRIMARY KEY,
+  batch_id TEXT NOT NULL REFERENCES batches(id),
+  station_id TEXT NOT NULL,
+  receiver TEXT NOT NULL,
+  ts REAL NOT NULL,
+  ref_id TEXT NOT NULL,
+  freq_hz INTEGER NOT NULL,
+  band TEXT,
+  coverage TEXT NOT NULL,     -- ok | no_reference | unverified
+  signal_db REAL, noise_db REAL, snr_db REAL,
+  gain REAL, pinned INTEGER DEFAULT 0,
+  status TEXT NOT NULL        -- ok | not_heard | no_reference | error
+);
+CREATE INDEX IF NOT EXISTS beacon_rx ON beacon_readings(station_id, receiver, ref_id, ts);
 """
 
 
@@ -71,6 +102,31 @@ class DB:
               1 if o.get("gated") else 0, json.dumps(o.get("meta") or {}),
               o.get("lat"), o.get("lon"), o.get("alt_m"), o.get("fix"))
              for o in batch.get("observations", [])])
+        for r in batch.get("receivers", []) or []:
+            if not r.get("receiver"):
+                continue
+            self.db.execute(
+                "INSERT INTO receivers(station_id,receiver,role,gain,antenna,"
+                "placement,updated_at) VALUES(?,?,?,?,?,?,?)"
+                " ON CONFLICT(station_id,receiver) DO UPDATE SET"
+                " role=excluded.role, gain=excluded.gain,"
+                " antenna=excluded.antenna, placement=excluded.placement,"
+                " updated_at=excluded.updated_at",
+                (batch["station_id"], r["receiver"], r.get("role"),
+                 r.get("gain"),
+                 json.dumps(r["antenna"]) if r.get("antenna") else None,
+                 json.dumps(r["placement"]) if r.get("placement") else None,
+                 time.time()))
+        self.db.executemany(
+            "INSERT INTO beacon_readings(batch_id,station_id,receiver,ts,"
+            "ref_id,freq_hz,band,coverage,signal_db,noise_db,snr_db,gain,"
+            "pinned,status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            [(batch["batch_id"], batch["station_id"], b.get("receiver"),
+              b.get("ts"), b.get("ref_id"), b.get("freq_hz"), b.get("band"),
+              b.get("coverage"), b.get("signal_db"), b.get("noise_db"),
+              b.get("snr_db"), b.get("gain"), 1 if b.get("pinned") else 0,
+              b.get("status"))
+             for b in batch.get("beacon_readings", []) or []])
         self.db.commit()
         return True
 
@@ -82,3 +138,27 @@ class DB:
             q += " WHERE freq_hz=?"
             args.append(freq_hz)
         return self.db.execute(q, args).fetchall()
+
+    def receiver_rows(self):
+        """Latest observer descriptor per (station_id, receiver)."""
+        cols = ("station_id", "receiver", "role", "gain", "antenna",
+                "placement", "updated_at")
+        rows = self.db.execute(
+            "SELECT station_id,receiver,role,gain,antenna,placement,"
+            "updated_at FROM receivers").fetchall()
+        return [dict(zip(cols, r)) for r in rows]
+
+    def beacon_latest(self):
+        """Most recent reading per (station_id, receiver, ref_id)."""
+        cols = ("station_id", "receiver", "ref_id", "freq_hz", "band",
+                "coverage", "signal_db", "noise_db", "snr_db", "gain",
+                "pinned", "status", "ts")
+        rows = self.db.execute(
+            "SELECT b.station_id,b.receiver,b.ref_id,b.freq_hz,b.band,"
+            "b.coverage,b.signal_db,b.noise_db,b.snr_db,b.gain,b.pinned,"
+            "b.status,b.ts FROM beacon_readings b JOIN (SELECT station_id,"
+            "receiver,ref_id,MAX(ts) t FROM beacon_readings GROUP BY "
+            "station_id,receiver,ref_id) m ON m.station_id=b.station_id"
+            " AND m.receiver=b.receiver AND m.ref_id=b.ref_id AND m.t=b.ts"
+            " ORDER BY b.station_id,b.receiver,b.freq_hz").fetchall()
+        return [dict(zip(cols, r)) for r in rows]

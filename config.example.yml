@@ -9,3 +9,18 @@ mqtt:
   # username: ssrf-obs
   # password: via SSRF_OBS_MQTT_PASSWORD env
   topic_prefix: rfsurvey
+
+# Optional: name the stations/systems heard on each frequency.
+# Matched by frequency against ssrf-lite's published channel index, so the
+# observers page can say WHO is known to use a channel instead of showing a
+# bare number. Purely additive: if this is unreachable or removed, every
+# channel just renders as a frequency again and grading is unaffected.
+names:
+  enabled: true
+  # Local index wins over the URL, so a private overlay can be mounted into
+  # /data without publishing it. Same shape as ssrf-lite's codeplug.json:
+  # [{"name": ..., "callsign": ..., "rx_mhz": ..., "tx_mhz": ..., "service": ...}]
+  # path: /data/names.json
+  url: https://chicago-offline.github.io/ssrf-lite/codeplug.json
+  refresh_s: 21600          # re-fetch at most every 6 h
+  tolerance_khz: 2.5        # nearest-match window for off-raster observations

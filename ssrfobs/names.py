@@ -130,6 +130,12 @@ class NameIndex:
                     "callsign": call,
                     "service": rec.get("service") or None,
                     "mode": rec.get("mode") or None,
+                    # Published tone/CC claims, carried through so the
+                    # observers page can show what the record says a
+                    # repeater uses. Claims, never measurements.
+                    "ctcss": rec.get("ctcss"),
+                    "dcs": rec.get("dcs"),
+                    "color_code": rec.get("color_code"),
                     "side": side,
                 })
         return by_hz
@@ -213,6 +219,9 @@ class NameIndex:
                     "callsign": top["callsign"],
                     "service": top["service"],
                     "mode": top["mode"],
+                    "ctcss": top.get("ctcss"),
+                    "dcs": top.get("dcs"),
+                    "color_code": top.get("color_code"),
                     "side": top["side"],
                     "exact": exact,
                     "names": names[:MAX_NAMES],

@@ -10,6 +10,7 @@ Routes:
   /channels.json per-channel verification rollup (same data as `report`)
   /monitors.json catalog-channel rollup from monitor checks: last heard,
                  hit rate, which observers, per-parameter verification
+  /repeaters.json amateur/GMRS repeaters heard in the last RECENT_S
   /stations.json enrolled stations + last-heard
   /names.json    status of the optional freq -> name index
 
@@ -33,6 +34,19 @@ DEFAULT_LIMIT = 100
 # only part of the page that answers "is anything happening", and a window
 # wide enough to always look busy would stop answering that question.
 ACTIVE_WINDOW_S = 900
+
+# "Recently" for the repeater directory on the page. A week keeps weekly
+# nets visible without letting a one-off from last month read as current
+# activity.
+RECENT_S = 7 * 86400
+
+# Deep link into the ssrf-lite browser. The site restores filters from the
+# URL hash (site/app.js applyHash), so ?q=<callsign> lands on the record.
+SSRF_BROWSE = "https://chicago-offline.github.io/ssrf-lite/#browse?q="
+
+# Only these services belong in the "repeaters heard" directory. Rail,
+# business, and unresolved energy stay in the JSON feeds.
+REPEATER_SERVICES = ("amateur", "gmrs")
 
 
 def identify(index, freq_hz):
@@ -266,15 +280,15 @@ def receivers(db):
     return rows
 
 
-def _tone_claim(params):
-    """Human-readable published claim from merged param_state.
+def _tone_text(params):
+    """Human-readable published tone/CC claim from merged param_state.
 
     Shows what the catalog says the channel uses, not what we observed.
     CTCSS -> "107.2 Hz", DCS -> "DCS 072", CC -> "CC 1", CSQ -> "CSQ",
-    nothing claimed -> dash.
+    nothing claimed -> "".
     """
     if not params:
-        return '<span class="unk">&mdash;</span>'
+        return ""
     parts = []
     ctcss = params.get("ctcss_hz")
     if ctcss:
@@ -294,27 +308,103 @@ def _tone_claim(params):
         obs = cc.get("observed")
         if obs is not None:
             parts.append("CC %s" % obs)
-    return html.escape(", ".join(parts)) if parts else '<span class="unk">&mdash;</span>'
+    return ", ".join(parts)
 
 
-def _tone_sort(params):
-    """Machine-sortable value for published tone/CC. CTCSS hz, else DCS 1000+,
-    else CC 2000+, else empty string (sorts last)."""
-    if not params:
+def _catalog_tone(ident):
+    """Published tone/CC straight from the ssrf-lite record.
+
+    A repeater that was heard but never monitored has no param_state to
+    merge, so the record's own claim is the only tone the page can honestly
+    show -- and it is presented as the claim, never as a measurement.
+    """
+    if not ident:
         return ""
-    ctcss = params.get("ctcss_hz")
-    if ctcss and ctcss.get("state") != "no_claim" and ctcss.get("observed"):
-        return ctcss["observed"]
-    dcs = params.get("dcs_code")
-    if dcs and dcs.get("state") != "no_claim" and dcs.get("observed"):
+    parts = []
+    ctcss = ident.get("ctcss")
+    if ctcss:
         try:
-            return 1000 + int(dcs["observed"])
+            parts.append("%.1f Hz" % float(ctcss))
         except (TypeError, ValueError):
-            return 1000
-    cc = params.get("color_code")
-    if cc and cc.get("state") != "no_claim" and cc.get("observed") is not None:
-        return 2000 + int(cc["observed"])
-    return ""
+            pass
+    dcs = ident.get("dcs")
+    if dcs:
+        parts.append("DCS %s" % str(dcs).zfill(3))
+    cc = ident.get("color_code")
+    if cc is not None:
+        parts.append("CC %s" % cc)
+    return ", ".join(parts)
+
+
+def repeaters(db, index=None, window_s=RECENT_S):
+    """Amateur/GMRS repeaters heard inside the window, newest first.
+
+    Two sources, monitors first. A monitor row knows its catalog target and
+    carries the published tone claim even when the name index is down, so
+    it is trusted as a repeater without needing the index. A plain
+    observation only knows the frequency, so it contributes only when the
+    name index resolves it to an amateur or GMRS record -- an unnamed hit
+    could be anything, and this table exists to say "that repeater is
+    alive", not "we heard energy".
+    """
+    now = time.time()
+    rows, seen = [], set()
+    for _key, m in monitors(db, index).items():
+        if not m["last_heard"] or now - m["last_heard"] > window_s:
+            continue
+        svc = m.get("service")
+        if svc and svc not in REPEATER_SERVICES:
+            continue
+        ident = identify(index, m["freq_hz"])
+        call = m.get("callsign") or \
+            ((m["target"] or "").split(" ") or [None])[0] or None
+        tone = _tone_text(m.get("params") or {}) or _catalog_tone(ident)
+        rows.append({
+            "freq_hz": m["freq_hz"],
+            "freq_mhz": round((m["freq_hz"] or 0) / 1e6, 4),
+            "name": m.get("name") or m["target"],
+            "callsign": call,
+            "service": svc,
+            "mode": (ident or {}).get("mode") or m.get("decoder"),
+            "tone": tone or None,
+            "last_heard": m["last_heard"],
+            "heard_by": m["observers_heard"],
+            "hit_rate": m["hit_rate"],
+            "checks": m["checks"],
+            "link": SSRF_BROWSE + urllib.parse.quote(call or m["target"]),
+            "source": "monitor",
+        })
+        seen.add(m["freq_hz"])
+    for f, c in channels(db, index).items():
+        if f in seen or not c.get("name"):
+            continue
+        if c.get("service") not in REPEATER_SERVICES:
+            continue
+        if not c["last_heard"] or now - c["last_heard"] > window_s:
+            continue
+        who = sorted(r[0] for r in db.db.execute(
+            "SELECT DISTINCT station_id FROM observations"
+            " WHERE freq_hz=? AND ts>=? AND gated=1",
+            (f, now - window_s)))
+        ident = identify(index, f)
+        call = c.get("callsign")
+        rows.append({
+            "freq_hz": f,
+            "freq_mhz": round(f / 1e6, 4),
+            "name": c["name"],
+            "callsign": call,
+            "service": c.get("service"),
+            "mode": (ident or {}).get("mode"),
+            "tone": _catalog_tone(ident) or None,
+            "last_heard": c["last_heard"],
+            "heard_by": who,
+            "hit_rate": None,
+            "checks": None,
+            "link": SSRF_BROWSE + urllib.parse.quote(call or c["name"]),
+            "source": "observed",
+        })
+    rows.sort(key=lambda r: -(r["last_heard"] or 0))
+    return rows
 
 
 def _ago(ts):
@@ -329,14 +419,6 @@ def _ago(ts):
 
 BADGE = {"verified": "#39FF14", "observed": "#00E5FF",
          "flagged": "#FFB300", "stale": "#888"}
-
-# Monitor statuses are NOT the V0-V3 evidence tiers, so they deliberately
-# do not reuse BADGE. A tier grades how well a signal was captured;
-# a monitor status describes OUR listening. Red on never_heard is the
-# point: it is the only status that accuses a catalog entry of being
-# wrong, and it should look like an accusation.
-MON_BADGE = {"active": "#39FF14", "stale": "#FFB300", "dormant": "#888",
-             "never_heard": "#FF5252", "watching": "#00E5FF"}
 
 
 PAGE = """<!doctype html>
@@ -357,7 +439,6 @@ PAGE = """<!doctype html>
  td{{padding:.35rem .6rem .35rem 0;border-bottom:1px solid #141b21}}
  .b{{display:inline-block;padding:0 .45rem;border-radius:3px;color:#0b0e11;
      font-weight:600;font-size:11px;letter-spacing:.04em}}
- .lvl{{color:#FFB300}}
  a{{color:#00E5FF}}
  .empty{{color:#6d7f8b;font-style:italic}}
  .hint{{color:#6d7f8b;font-size:11px}}
@@ -368,98 +449,47 @@ PAGE = """<!doctype html>
  th.sx::after{{content:"\\2195";opacity:.3;margin-left:.3rem;font-size:10px}}
  th.asc::after{{content:"\\2191";opacity:1;color:#00E5FF}}
  th.desc::after{{content:"\\2193";opacity:1;color:#00E5FF}}
- .live{{border:1px solid #14323a;background:#0d1519;border-radius:6px;
-        padding:.8rem .9rem}}
- .live h2{{margin-top:0}}
- .dot{{display:inline-block;width:.5rem;height:.5rem;border-radius:50%;
-       background:#39FF14;margin-right:.45rem;vertical-align:middle}}
- .dot.off{{background:#42525c}}
- .filt{{margin:0 0 .6rem}}
- .filt button{{background:#111a20;color:#6d7f8b;border:1px solid #1d262e;
-   border-radius:3px;font:inherit;font-size:11px;padding:.15rem .55rem;
-   margin-right:.3rem;cursor:pointer}}
- .filt button.on{{color:#0b0e11;background:#00E5FF;border-color:#00E5FF;
-   font-weight:600}}
  .who{{color:#8fa3b0;font-size:12px}}
- .monhdr{{display:flex;flex-wrap:wrap;gap:.5rem 1.5rem;font-size:12px;
-          color:#6d7f8b;margin:-.25rem 0 .75rem;align-items:center}}
- .monhdr .pill{{display:inline-block;padding:0 .45rem;border-radius:3px;
-               color:#0b0e11;font-weight:600;font-size:11px}}
  .tone{{color:#8fa3b0;font-size:12px}}
 </style>
 <h1>&#128225; CHICAGO OFFLINE &mdash; RF OBSERVERS</h1>
-<p class="sub">Signed survey evidence from enrolled receive stations.
- Feed: <a href="/active.json">/active.json</a> &middot;
- <a href="/feed.json">/feed.json</a> &middot;
- <a href="/channels.json">/channels.json</a> &middot;
- <a href="/monitors.json">/monitors.json</a> &middot;
- <a href="/stations.json">/stations.json</a> &middot;
- <a href="/beacons.json">/beacons.json</a> &middot;
- <a href="/receivers.json">/receivers.json</a> &middot;
- <a href="/names.json">/names.json</a>
- <br><span class="hint">Click any column heading to sort.</span></p>
+<p class="sub">Who is listening on the Chicagoland airwaves, and which local
+ repeaters they have actually heard lately.
+ <span class="hint">Click any column heading to sort.</span></p>
 
-<h2>Channel monitoring <span class="n">{monitorn}</span></h2>
-<p class="sub">Catalog channels checked on a schedule whether or not the
- sweep sees energy there &mdash; the answer to &ldquo;is this repeater
- actually on the air?&rdquo; A <em>silent</em> check is the whole point: it
- is what separates a dead machine from one nobody ever pointed a receiver
- at. <code>watching</code> = checked, but not yet hard enough to claim
- anything. <code>never_heard</code> = checked hard enough to mean it and
- still always silent, which is a finding against the
- <a href="https://chicago-offline.github.io/ssrf-lite/">ssrf-lite</a>
- entry &mdash; so it takes many checks across many days before it will say
- so. Hit rate is over checks actually performed, not over wall time: it
- answers &ldquo;when we listen, how often is it there&rdquo;, which is what
- a scan list cares about. Targets are fenced by distance, so a repeater
- nobody here could hear is absent rather than slandered as silent.
- Published tone/CC shows the catalog claim; a dash means the catalog is
- silent on that parameter.</p>
-{monhdr}
-{monitors}
+<h2>Observers <span class="n">&amp; beacon calibration</span></h2>
+<p class="sub">Enrolled receive stations, and the reference beacon each
+ receiver is calibrated against (rf-survey NETWORK.md &sect;7). Calibration
+ bounds <em>hardware</em> variance &mdash; dead dongle, wet feedline, moved
+ antenna, drifting gain &mdash; never propagation.</p>
+{observers}
 
-<div class="live">
-<h2><span class="dot{livedot}"></span>On the air &mdash; last {window} min
- <span class="n">{livecount}</span></h2>
-{active}
-</div>
+<h2>Repeaters heard &mdash; last {days} days <span class="n">{repn}</span></h2>
+<p class="sub">Amateur and GMRS repeaters from
+ <a href="https://chicago-offline.github.io/ssrf-lite/">ssrf-lite</a> heard
+ by at least one observer. Tone/CC is the record's published claim, not a
+ measurement. Each entry links to its ssrf-lite record. Full evidence &mdash;
+ including channels checked and never heard &mdash; stays in the JSON
+ feeds below.</p>
+{repeaters}
 
-<h2>Observer stations</h2>
-{stations}
-
-<h2>Recent observations <span class="n">last {recentn}</span></h2>
-{recent}
-
-<h2>Channel roll-up <span class="n">every frequency ever heard</span></h2>
-<p class="sub">The archive, not the live picture &mdash; one row per distinct
- frequency across the whole append-only DB, which is why it is long. Its job
- is to show <em>coverage gaps</em>: a resolved channel with no name is a
- missing <a href="https://chicago-offline.github.io/ssrf-lite/">ssrf-lite</a>
- entry worth filing. <span class="hint">(input)</span> = matched a repeater's
- input side. <span class="hint">(near)</span> = off-raster, matched inside the
- tolerance window. <span class="unk">&mdash;</span> = no entry in ssrf-lite
- yet. <span class="hint">(unresolved)</span> rows are sweep artifacts, not
- channels &mdash; the bin was too wide to identify one channel, so they are
- hidden by default.</p>
-{channels}
-
-<h2>Beacon calibration</h2>
-<p class="sub">Reference emitters (NETWORK.md &sect;7) bound
- <em>hardware</em> variance per observer &mdash; dead dongle, wet feedline,
- moved antenna, drifting gain. Never propagation, never evidence about a
- surveyed channel. <code>no_reference</code> = outside this observer's
- declared antenna reach, correctly excluded, not hidden.
- <code>unverified</code> = antenna undeclared; measured, can't be scored.</p>
-{beacons}
-
-<footer>ssrf-obs &middot; append-only evidence &middot; tiers V0 heard /
- V1 decoded / V2 voice / V3 recorded &middot; generated {now}</footer>
+<footer>ssrf-obs &middot; append-only evidence &middot; full feeds:
+ <a href="/repeaters.json">repeaters</a> &middot;
+ <a href="/active.json">active</a> &middot;
+ <a href="/feed.json">observations</a> &middot;
+ <a href="/channels.json">channels</a> &middot;
+ <a href="/monitors.json">monitors</a> &middot;
+ <a href="/stations.json">stations</a> &middot;
+ <a href="/beacons.json">beacons</a> &middot;
+ <a href="/receivers.json">receivers</a> &middot;
+ <a href="/names.json">names</a>
+ &middot; generated {now}</footer>
 {script}
 """
 
 # Vanilla JS on purpose: the server is stdlib http.server and the page is
-# a few hundred rows. Sorting reads td[data-v] so "3h ago" sorts by epoch
-# and "460.1250" sorts as a number, not as text.
+# a few dozen rows. Sorting reads td[data-v] so "3h ago" sorts by epoch
+# and "146.8800" sorts as a number, not as text.
 SCRIPT = """<script>
 (function(){
  function key(td){
@@ -498,36 +528,13 @@ SCRIPT = """<script>
  }
  Array.prototype.forEach.call(
   document.querySelectorAll('table.s'),sortable);
-
- var box=document.getElementById('chfilter'),
-     tbl=document.getElementById('chtable');
- if(box&&tbl){
-  var btns=box.getElementsByTagName('button');
-  function apply(mode){
-   Array.prototype.forEach.call(tbl.tBodies[0].rows,function(r){
-    var ok=(mode==='all')||
-           (mode==='named'&&r.getAttribute('data-named')==='1')||
-           (mode==='res'&&r.getAttribute('data-res')==='1');
-    r.style.display=ok?'':'none';});
-   Array.prototype.forEach.call(btns,function(b){
-    if(b.getAttribute('data-m')===mode){b.classList.add('on');}
-    else{b.classList.remove('on');}});
-   try{localStorage.setItem('chmode',mode);}catch(e){}
-  }
-  Array.prototype.forEach.call(btns,function(b){
-   b.addEventListener('click',function(){
-    apply(b.getAttribute('data-m'));});});
-  var saved=null;
-  try{saved=localStorage.getItem('chmode');}catch(e){}
-  apply(saved||'res');
- }
 })();
 </script>"""
 
 
 def _td(disp, sort=None, cls=None):
     """One cell. sort is the machine-sortable value behind the display text
-    (epoch behind "3h ago", float behind "460.1250 MHz")."""
+    (epoch behind "3h ago", float behind "146.8800 MHz")."""
     a = ""
     if cls:
         a += ' class="%s"' % cls
@@ -546,265 +553,88 @@ def _fnum(v, fmt="%.1f", dash="-"):
     return dash if v is None else fmt % v
 
 
-def _ident_cell(row):
-    """Identity table cell: the name, plus hints when the match is indirect."""
-    name = row.get("name")
-    if not name:
-        if row.get("channel_snap") is False:
-            # Not "we don't know who" but "the sweep couldn't resolve a
-            # channel here", which is a different (and fixable) problem.
-            return ('<td data-v="" class="unk">&mdash; <span class="hint"'
-                    ' title="rf-survey could not snap this hit to a channel'
-                    ' raster point, so the frequency is a bin centre rather'
-                    ' than a channel. Needs a narrower sweep bin or a'
-                    ' refined dwell before it can be named.">'
-                    '(unresolved)</span></td>')
-        return '<td data-v="" class="unk">&mdash;</td>'
-    extra = []
-    call = row.get("callsign")
-    if call and call != name:
-        extra.append(call)
-    if row.get("name_side") == "in":
-        extra.append("input")
-    if row.get("name_exact") is False:
-        extra.append("near")
-    n = row.get("matches") or 0
-    if n > 1:
-        extra.append("+%d more" % (n - 1))
-    cell = html.escape(name)
-    if extra:
-        cell += ' <span class="hint">(%s)</span>' % html.escape(
-            ", ".join(extra))
-    return '<td data-v="%s">%s</td>' % (html.escape(name, quote=True), cell)
-
-
-
-def _active_html(db, index):
-    """Live window table + an empty state that says how quiet it is."""
-    act = active(db, index=index)
-    if not act:
-        last = last_observation_ts(db)
-        if last is None:
-            return ('<p class="empty">no observations yet &mdash; stations '
-                    'are enrolled but nothing has been reported</p>'), "", " off"
-        return ('<p class="empty">nothing on the air in the last %d min '
-                '&mdash; most recent hit was %s</p>'
-                % (ACTIVE_WINDOW_S // 60, _ago(last))), "", " off"
-    rows = ""
-    for o in act:
-        who = ", ".join(o["observers"])
-        rows += "<tr>" + "".join((
-            _td(_ago(o["ts"]), o["ts"]),
-            _td(_fnum(o["freq_mhz"], "%.4f"), o["freq_mhz"] or ""),
-            _ident_cell(o),
-            _td(html.escape(who), who, cls="who"),
-            _td(o["level"] or "-", o["level"] or "", cls="lvl"),
-            _td(_fnum(o["best_snr"]),
-                "" if o["best_snr"] is None else o["best_snr"]),
-            _td(o["hits"], o["hits"]),
-        )) + "</tr>"
-    tbl = _table(["when", "MHz", "station / system", "heard by", "tier",
-                  "best SNR", "hits"], rows)
-    n = "%d channel%s" % (len(act), "" if len(act) == 1 else "s")
-    return tbl, n, ""
-
-
 def render(db, registry, index=None):
-    act_html, act_n, act_dot = _active_html(db, index)
-
+    # ------------------------------------------- observers + calibration
     sts = stations(db, registry)
+    cal = {}
+    for b in beacons(db):
+        cal.setdefault(b["station_id"], []).append(b)
     if sts:
         rows = ""
         for s in sts:
-            rows += "<tr>" + "".join((
-                _td(html.escape(s["station_id"]), s["station_id"]),
-                _td(_ago(s["last_batch"]), s["last_batch"] or ""),
-                _td(s["observations"], s["observations"]),
-                _td(s["sweep_bins"], s["sweep_bins"]),
-            )) + "</tr>"
-        st_html = _table(["station", "last batch", "obs", "sweep bins"], rows)
+            refs = sorted(cal.get(s["station_id"], []),
+                          key=lambda x: (x["receiver"], x["freq_hz"]))
+            if not refs:
+                # An observer with no beacon reference is still an
+                # observer -- show it, and show the gap.
+                rows += "<tr>" + "".join((
+                    _td(html.escape(s["station_id"]), s["station_id"]),
+                    _td('<span class="unk">&mdash;</span>', ""),
+                    _td('<span class="unk">no beacon reference</span>', ""),
+                    _td("-", ""), _td("-", ""), _td("-", ""), _td("-", ""),
+                    _td(_ago(s["last_batch"]), s["last_batch"] or ""),
+                )) + "</tr>"
+                continue
+            for b in refs:
+                color = BADGE.get(b["badge"], "#888")
+                ref = ('%s <span class="hint">@ %.4f MHz</span>'
+                       % (html.escape(b["ref_id"]), b["freq_hz"] / 1e6))
+                rows += "<tr>" + "".join((
+                    _td(html.escape(s["station_id"]), s["station_id"]),
+                    _td(html.escape(b["receiver"]), b["receiver"]),
+                    _td(ref, b["ref_id"]),
+                    _td('<span class="b" style="background:%s">%s</span>'
+                        % (color, b["badge"].upper()), b["badge"]),
+                    _td(_fnum(b["snr_db"]),
+                        "" if b["snr_db"] is None else b["snr_db"]),
+                    _td(_fnum(b["drift_db"], "%+.1f", "n/a"),
+                        "" if b["drift_db"] is None else b["drift_db"]),
+                    _td(_ago(b["ts"]), b["ts"]),
+                    _td(_ago(s["last_batch"]), s["last_batch"] or ""),
+                )) + "</tr>"
+        obs_html = _table(["station", "receiver", "calibrated to", "status",
+                           "SNR dB", "drift", "last reading", "last report"],
+                          rows, tid="obstable")
     else:
-        st_html = '<p class="empty">no stations enrolled</p>'
+        obs_html = '<p class="empty">no stations enrolled</p>'
 
-    ch = channels(db, index)
-    if ch:
+    # ------------------------------------------- repeaters heard recently
+    reps = repeaters(db, index)
+    if reps:
         rows = ""
-        n_named = n_res = 0
-        for f, c in sorted(ch.items()):
-            named = 1 if c.get("name") else 0
-            res = 1 if c.get("channel_snap") else 0
-            n_named += named
-            n_res += res
-            color = BADGE.get(c["status"], "#888")
-            mhz = f / 1e6
-            rows += '<tr data-named="%d" data-res="%d">' % (named, res)
-            rows += "".join((
-                _td("%.4f MHz" % mhz, "%.6f" % mhz),
-                _ident_cell(c),
-                _td(c["level"], c["level"], cls="lvl"),
-                _td('<span class="b" style="background:%s">%s</span>'
-                    % (color, c["status"].upper()), c["status"]),
-                _td(_ago(c["last_heard"]), c["last_heard"] or ""),
-                _td(c["v1_stations"], c["v1_stations"]),
-            )) + "</tr>"
-        filt = ('<div class="filt" id="chfilter">'
-                '<button data-m="res">resolved channels (%d)</button>'
-                '<button data-m="named">named in ssrf-lite (%d)</button>'
-                '<button data-m="all">everything (%d)</button></div>'
-                % (n_res, n_named, len(ch)))
-        ch_html = filt + _table(
-            ["frequency", "station / system", "tier", "status", "last heard",
-             "V1 stations"], rows, tid="chtable")
-    else:
-        ch_html = ('<p class="empty">no graded channels yet &mdash; '
-                   'stations are sweeping, nothing has tripped the dwell gate'
-                   '</p>')
-
-    items = feed(db, limit=25, index=index)
-    if items:
-        rows = ""
-        for o in items:
+        for r in reps:
+            name = r["name"] or "?"
+            label = html.escape(name)
+            call = r["callsign"]
+            if call and call not in name:
+                label += (' <span class="hint">(%s)</span>'
+                          % html.escape(call))
+            cell = ('<a href="%s">%s</a>'
+                    % (html.escape(r["link"], quote=True), label))
+            who = ", ".join(r["heard_by"] or [])
             rows += "<tr>" + "".join((
-                _td(_ago(o["ts"]), o["ts"]),
-                _td(html.escape(o["station_id"]), o["station_id"]),
-                _td("%.4f" % o["freq_mhz"] if o["freq_mhz"] else "?",
-                    o["freq_mhz"] or ""),
-                _ident_cell(o),
-                _td(html.escape(o["decoder"] or "-"), o["decoder"] or ""),
-                _td(o["level"] or "-", o["level"] or "", cls="lvl"),
-                _td(_fnum(o["snr_db"]),
-                    "" if o["snr_db"] is None else o["snr_db"]),
-            )) + "</tr>"
-        rc_html = _table(["when", "observer", "MHz", "station / system",
-                          "decoder", "tier", "SNR dB"], rows)
-    else:
-        rc_html = '<p class="empty">no observations yet</p>'
-
-    bl = beacons(db)
-    if bl:
-        rows = ""
-        for b in sorted(bl, key=lambda x: (x["station_id"], x["receiver"],
-                                           x["freq_hz"])):
-            color = BADGE.get(b["badge"], "#888")
-            rows += "<tr>" + "".join((
-                _td(html.escape(b["station_id"]), b["station_id"]),
-                _td(html.escape(b["receiver"]), b["receiver"]),
-                _td(html.escape(b["ref_id"]), b["ref_id"]),
-                _td("%.4f" % (b["freq_hz"] / 1e6), b["freq_hz"]),
-                _td('<span class="b" style="background:%s">%s</span>'
-                    % (color, b["badge"].upper()), b["badge"]),
-                _td(_fnum(b["snr_db"]),
-                    "" if b["snr_db"] is None else b["snr_db"]),
-                _td(_fnum(b["drift_db"], "%+.1f", "n/a"),
-                    "" if b["drift_db"] is None else b["drift_db"]),
-                _td(_ago(b["ts"]), b["ts"]),
-            )) + "</tr>"
-        bc_html = _table(["station", "receiver", "reference", "MHz", "status",
-                          "SNR dB", "drift", "last reading"], rows)
-    else:
-        bc_html = ('<p class="empty">no beacon-check runs reported yet '
-                   '&mdash; run <code>survey beacon-check --serial '
-                   '&lt;serial&gt;</code> on an observer</p>')
-
-    # Status sort order: active < stale < dormant < watching < never_heard
-    # Within same status: most recently heard first (None last).
-    _MON_ORDER = {"active": 0, "stale": 1, "dormant": 2,
-                  "watching": 3, "never_heard": 4}
-
-    mons = monitors(db, index)
-    if mons:
-        rows = ""
-        tally = {}
-        last_checked_all = []
-        sorted_mons = sorted(
-            mons.items(),
-            key=lambda kv: (
-                _MON_ORDER.get(kv[1]["status"], 9),
-                -(kv[1]["last_heard"] or 0),
-                kv[1]["freq_hz"] or 0,
-            )
-        )
-        for _key, m in sorted_mons:
-            tally[m["status"]] = tally.get(m["status"], 0) + 1
-            if m["last_checked"]:
-                last_checked_all.append(m["last_checked"])
-            color = MON_BADGE.get(m["status"], "#888")
-            mhz = (m["freq_hz"] or 0) / 1e6
-            obs = m["observers"] or []
-            heard_by = m["observers_heard"] or []
-            # Show who HEARD it when anyone has, otherwise who is
-            # listening. A silent row still has to name its observers or
-            # "never heard" is an unattributable claim.
-            who = ", ".join(heard_by or obs)
-            # Published tone/CC: pull from merged param_state.
-            # Show the catalog claim, not the observed value — this is
-            # "what does ssrf-lite say" so the reader can compare to
-            # what we actually verified.
-            tone_disp = _tone_claim(m.get("params") or {})
-            rows += "<tr>" + "".join((
-                _td("%.4f MHz" % mhz, "%.6f" % mhz),
-                _td(html.escape(m["target"] or "-"), m["target"] or ""),
-                _td(html.escape(m["decoder"] or "-"), m["decoder"] or ""),
-                _td(tone_disp, _tone_sort(m.get("params") or {}),
-                    cls="tone"),
-                _td('<span class="b" style="background:%s">%s</span>'
-                    % (color, m["status"].upper().replace("_", " ")),
-                    m["status"]),
-                _td(m["checks"], m["checks"]),
-                _td(m["hearings"], m["hearings"]),
-                _td("%.0f%%" % (m["hit_rate"] * 100), m["hit_rate"]),
-                _td(_ago(m["last_heard"]), m["last_heard"] or ""),
-                _td(_ago(m["last_checked"]), m["last_checked"] or ""),
+                _td("%.4f MHz" % r["freq_mhz"], "%.6f" % r["freq_mhz"]),
+                _td(cell, name),
+                _td(html.escape(r["service"] or "-"), r["service"] or ""),
+                _td(html.escape(r["mode"] or "-"), r["mode"] or ""),
+                _td(html.escape(r["tone"]) if r["tone"]
+                    else '<span class="unk">&mdash;</span>',
+                    r["tone"] or "", cls="tone"),
+                _td(_ago(r["last_heard"]), r["last_heard"] or ""),
                 _td(html.escape(who) or '<span class="unk">&mdash;</span>',
                     who, cls="who"),
             )) + "</tr>"
-        mon_html = _table(["frequency", "target", "mode", "published tone/CC",
-                           "status", "checks", "heard", "hit rate",
-                           "last heard", "last checked", "observers"],
-                          rows, tid="montable")
-        mon_n = ", ".join("%d %s" % (n, s.replace("_", " "))
-                          for s, n in sorted(tally.items(),
-                                             key=lambda kv: (-kv[1], kv[0])))
-        # Monitoring health header: freshness + observer count.
-        n_observers = len({
-            o for _k, m in sorted_mons
-            for o in (m["observers"] or [])
-        })
-        if last_checked_all:
-            freshest = max(last_checked_all)
-            mon_hdr = ('<div class="monhdr">'
-                       '<span>%d channels watched</span>'
-                       '<span>last check <strong>%s</strong></span>'
-                       '<span>%d observer%s active</span>'
-                       '%s</div>' % (
-                           len(mons),
-                           _ago(freshest),
-                           n_observers,
-                           "" if n_observers == 1 else "s",
-                           " ".join(
-                               '<span class="pill" style="background:%s">'
-                               '%d %s</span>' % (
-                                   MON_BADGE.get(s, "#888"),
-                                   n, s.replace("_", " "))
-                               for s, n in sorted(
-                                   tally.items(),
-                                   key=lambda kv: _MON_ORDER.get(kv[0], 9))
-                           )
-                       ))
-        else:
-            mon_hdr = ""
+        rep_html = _table(["frequency", "repeater", "service", "mode",
+                           "tone / CC", "last heard", "heard by"],
+                          rows, tid="reptable")
+        rep_n = "%d heard" % len(reps)
     else:
-        mon_html = ('<p class="empty">nothing monitored yet &mdash; add a '
-                    "<code>monitor:</code> block with a "
-                    "<code>targets_file</code> to an observer plan</p>")
-        mon_n = "none"
-        mon_hdr = ""
+        rep_html = ('<p class="empty">no amateur or GMRS repeaters heard in '
+                    "the last %d days</p>" % (RECENT_S // 86400))
+        rep_n = "none yet"
 
-    return PAGE.format(active=act_html, livecount=act_n, livedot=act_dot,
-                       window=ACTIVE_WINDOW_S // 60,
-                       stations=st_html, channels=ch_html, recent=rc_html,
-                       recentn=len(items), monitors=mon_html, monitorn=mon_n,
-                       monhdr=mon_hdr, beacons=bc_html, script=SCRIPT,
+    return PAGE.format(observers=obs_html, repeaters=rep_html, repn=rep_n,
+                       days=RECENT_S // 86400, script=SCRIPT,
                        now=time.strftime("%Y-%m-%d %H:%M:%SZ", time.gmtime()))
 
 
@@ -834,6 +664,12 @@ def make_handler(db, registry, index=None):
                 if u.path == "/":
                     self._send(200, render(db, registry, index),
                                "text/html; charset=utf-8")
+                elif u.path == "/repeaters.json":
+                    items = repeaters(db, index)
+                    self._json({"generated": time.time(),
+                                "window_s": RECENT_S,
+                                "count": len(items),
+                                "repeaters": items})
                 elif u.path == "/active.json":
                     w = q.get("window", [ACTIVE_WINDOW_S])[0]
                     w = int(w) if str(w).isdigit() else ACTIVE_WINDOW_S
@@ -891,4 +727,3 @@ def serve(cfg, registry, db):
                                 make_handler(db, registry, index))
     log.info("observers page on http://%s:%d/", host, port)
     httpd.serve_forever()
-

@@ -189,114 +189,88 @@ if __name__ == "__main__":
     unittest.main()
 
 
-class MonitorRenderTest(unittest.TestCase):
-    """The page must SHOW silence, not just store it."""
+class RepeaterPageTest(unittest.TestCase):
+    """The page is a directory: who is observing, and which amateur/GMRS
+    repeaters were actually heard lately. Silence remains a first-class
+    finding, but it lives in /monitors.json now, not on the page."""
 
     def setUp(self):
         self.dir = tempfile.mkdtemp()
         self.db = db_mod.DB(os.path.join(self.dir, "t.db"))
 
-    def test_empty_state_names_the_missing_config(self):
+    def test_empty_state(self):
         page = web.render(self.db, {})
-        self.assertIn("Channel monitoring", page)
-        self.assertIn("nothing monitored yet", page)
-        # An empty section must say WHAT to add, or it reads as broken.
-        self.assertIn("targets_file", page)
+        self.assertIn("no amateur or GMRS repeaters heard", page)
+        self.assertIn("no stations enrolled", page)
 
-    def test_never_heard_channel_is_visible_on_the_page(self):
-        # channels() hides never-heard entries; the monitoring section is
-        # the only place this finding can surface at all. Checks must span
-        # DAYS, not hours: never_heard needs volume AND span, so hourly
-        # samples would (correctly) still read "watching".
-        self.db.insert_batch(_batch(
-            [_chk(ts=NOW - i * (DAY / 4), heard=False) for i in range(60)]))
+    def test_heard_monitor_target_is_listed_and_linked(self):
+        self.db.insert_batch(_batch([_chk(heard=True, ts=time.time())]))
         page = web.render(self.db, {})
-        self.assertIn("145.4700 MHz", page)
-        self.assertIn("NEVER HEARD", page)
-        self.assertIn(web.MON_BADGE["never_heard"], page)
-
-    def test_thin_silence_shows_watching_not_an_accusation(self):
-        self.db.insert_batch(_batch([_chk(heard=False)]))
-        page = web.render(self.db, {})
-        self.assertIn("WATCHING", page)
-        self.assertNotIn("NEVER HEARD", page)
-
-    def test_silent_row_still_names_its_observers(self):
-        # "never heard" with no attribution is an unattributable claim.
-        self.db.insert_batch(_batch(
-            [_chk(ts=NOW - i * (DAY / 4), heard=False) for i in range(60)]))
-        page = web.render(self.db, {})
+        self.assertIn("NS9RC 145.470", page)
+        # Deep link into the ssrf-lite browser by callsign.
+        self.assertIn("ssrf-lite/#browse?q=NS9RC", page)
+        # Heard-by attribution must survive the simplification.
         self.assertIn("sta-a/rtl:0", page)
 
-    def test_heard_channel_reports_hit_rate(self):
-        checks = [_chk(ts=NOW - i * 3600, heard=(i % 4 == 0))
-                  for i in range(60)]
-        self.db.insert_batch(_batch(checks))
+    def test_silent_target_stays_off_the_page_but_in_the_data(self):
+        now = time.time()
+        self.db.insert_batch(_batch(
+            [_chk(ts=now - i * (DAY / 4), heard=False) for i in range(60)]))
         page = web.render(self.db, {})
-        self.assertIn("Channel monitoring", page)
-        self.assertNotIn("NEVER HEARD", page)
+        self.assertNotIn("NS9RC", page)
+        mons = web.monitors(self.db)
+        self.assertEqual(len(mons), 1)
+        self.assertEqual(next(iter(mons.values()))["status"], "never_heard")
 
-    def test_monitoring_section_precedes_the_roll_up(self):
-        # The roll-up is ~70% of the page by bytes, so anything below it is
-        # effectively unreachable by scrolling. Monitoring answers "is this
-        # repeater on the air", which is the question people arrive with.
+    def test_old_hearing_falls_out_of_the_window(self):
+        self.db.insert_batch(_batch(
+            [_chk(heard=True, ts=time.time() - 30 * DAY)]))
         page = web.render(self.db, {})
-        self.assertLess(page.index("Channel monitoring"),
-                        page.index("Channel roll-up"))
+        self.assertNotIn("NS9RC", page)
 
-    def test_monitoring_section_precedes_live_window(self):
-        # Live window answers "what's on right now"; monitoring answers
-        # "is this repeater alive" — the higher-value question leads.
-        page = web.render(self.db, {})
-        self.assertLess(page.index("Channel monitoring"),
-                        page.index("On the air"))
-
-    def test_health_header_appears_when_checks_present(self):
-        self.db.insert_batch(_batch([_chk(heard=False)]))
-        page = web.render(self.db, {})
-        self.assertIn("channels watched", page)
-        self.assertIn("last check", page)
-        self.assertIn("observer", page)
-
-    def test_health_header_absent_when_no_monitors(self):
-        # Empty state must not emit a misleading "0 channels watched" header.
-        page = web.render(self.db, {})
-        self.assertNotIn("channels watched", page)
-
-    def test_default_sort_active_before_watching(self):
-        # Active entries must render before watching entries in the default
-        # (unsorted) page order — status priority, not frequency order.
-        import time as _time
-        heard_chk = _chk(target="KA9HHH 146.880", freq_hz=146_880_000,
-                         ssrf_id="ka9hhh:146880", heard=True, ts=NOW - 3600)
-        silent_chk = _chk(target="NS9RC 145.470", freq_hz=145_470_000,
-                          heard=False)
-        self.db.insert_batch(_batch([heard_chk, silent_chk], bid="b2"))
-        page = web.render(self.db, {})
-        self.assertLess(page.index("KA9HHH"), page.index("NS9RC"))
-
-    def test_published_tone_column_present(self):
-        # The tone/CC column header must exist whether or not params are set.
-        self.db.insert_batch(_batch([_chk(heard=False)]))
-        page = web.render(self.db, {})
-        self.assertIn("published tone", page)
-
-    def test_published_tone_shows_ctcss_claim(self):
+    def test_tone_claim_renders(self):
         p = {"ctcss_hz": {"state": "verified", "observed": 107.2}}
-        self.db.insert_batch(_batch([_chk(params=p, heard=True)]))
+        self.db.insert_batch(_batch(
+            [_chk(params=p, heard=True, ts=time.time())]))
         page = web.render(self.db, {})
         self.assertIn("107.2 Hz", page)
 
-    def test_published_tone_shows_color_code(self):
+    def test_color_code_claim_renders(self):
         p = {"color_code": {"state": "verified", "observed": 1}}
-        self.db.insert_batch(_batch([_chk(params=p, heard=True)]))
+        self.db.insert_batch(_batch(
+            [_chk(params=p, heard=True, ts=time.time())]))
         page = web.render(self.db, {})
         self.assertIn("CC 1", page)
 
-    def test_published_tone_dash_when_no_claim(self):
-        # No params in the check -> dash in the tone column, not an error.
-        self.db.insert_batch(_batch([_chk(heard=False)]))
+    def test_no_claim_renders_a_dash_not_an_error(self):
+        self.db.insert_batch(_batch([_chk(heard=True, ts=time.time())]))
         page = web.render(self.db, {})
-        # The tone column header exists; at least one dash cell must follow.
-        self.assertIn("published tone", page)
-        self.assertIn("&mdash;", page)  # emitted as HTML entity
+        self.assertIn("&mdash;", page)
+
+    def test_repeaters_json_shape(self):
+        self.db.insert_batch(_batch([_chk(heard=True, ts=time.time())]))
+        reps = web.repeaters(self.db)
+        self.assertEqual(len(reps), 1)
+        r = reps[0]
+        self.assertEqual(r["freq_hz"], 145_470_000)
+        self.assertTrue(r["link"].endswith("q=NS9RC"))
+        self.assertEqual(r["heard_by"], ["sta-a/rtl:0"])
+        self.assertEqual(r["source"], "monitor")
+
+    def test_beacon_calibration_shows_next_to_station(self):
+        b = _batch([])
+        b["beacon_readings"] = [{
+            "receiver": "rtl:0", "ts": time.time(), "ref_id": "WA9ORC",
+            "freq_hz": 144_750_000, "band": "2m", "coverage": "ok",
+            "signal_db": -20.0, "noise_db": -35.0, "snr_db": 15.0,
+            "gain": 30.0, "pinned": True, "status": "ok"}]
+        self.db.insert_batch(b)
+        page = web.render(self.db, {"sta-a": "not-a-real-pubkey"})
+        self.assertIn("WA9ORC", page)
+        self.assertIn("sta-a", page)
+        self.assertIn("VERIFIED", page)
+
+    def test_observer_without_beacon_shows_the_gap(self):
+        self.db.insert_batch(_batch([_chk(heard=False)]))
+        page = web.render(self.db, {"sta-a": "not-a-real-pubkey"})
+        self.assertIn("no beacon reference", page)

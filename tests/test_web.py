@@ -27,10 +27,13 @@ class TestWeb(unittest.TestCase):
     def test_empty_surface_renders(self):
         page = web.render(self.db, self.reg)
         self.assertIn("RF OBSERVERS", page)
-        self.assertIn("no observations yet", page)
-        self.assertIn("no graded channels yet", page)
+        # An enrolled station renders even before it reports anything.
+        self.assertIn("sta-a", page)
+        self.assertIn("no beacon reference", page)
+        self.assertIn("no amateur or GMRS repeaters heard", page)
         self.assertEqual(web.feed(self.db), [])
         self.assertEqual(web.channels(self.db), {})
+        self.assertEqual(web.repeaters(self.db), [])
 
     def test_feed_and_channels_after_ingest(self):
         self.ingest_one()
@@ -46,8 +49,9 @@ class TestWeb(unittest.TestCase):
         self.assertEqual(ch[460000000]["level"], "V1")
 
         page = web.render(self.db, self.reg)
-        self.assertIn("460.0000 MHz", page)
         self.assertIn("sta-a", page)
+        # Unnamed non-repeater energy stays in the JSON feeds, off the page.
+        self.assertNotIn("460.0000 MHz", page)
 
     def test_feed_limit_and_freq_filter(self):
         for i in range(5):
@@ -69,13 +73,15 @@ class TestWeb(unittest.TestCase):
         blob = json.dumps(sts) + web.render(self.db, self.reg)
         self.assertNotIn(self.pub, blob)
 
-    def test_flagged_status_shows_on_page(self):
+    def test_flagged_status_survives_in_channels_json(self):
+        # The page no longer renders the roll-up, but the finding must
+        # still be visible to consumers of /channels.json.
         keyb, pubb = make_station()
         self.reg["sta-b"] = pubb
         self.ingest_one(bid="b-a", cc=9)
         self.ingest_one(bid="b-b", cc=5, sid="sta-b", key=keyb)
-        page = web.render(self.db, self.reg)
-        self.assertIn("FLAGGED", page)
+        ch = web.channels(self.db)
+        self.assertEqual(ch[460000000]["status"], "flagged")
 
 
 if __name__ == "__main__":

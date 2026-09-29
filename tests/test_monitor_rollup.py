@@ -270,6 +270,25 @@ class RepeaterPageTest(unittest.TestCase):
         self.assertIn("sta-a", page)
         self.assertIn("VERIFIED", page)
 
+    def test_measured_no_reference_beacon_reads_observed_not_verified(self):
+        # rf-survey measures no_reference bands since 2026-09-28. Real
+        # reception on an antenna not rated for the band is a datum, not a
+        # calibration pass: OBSERVED, never VERIFIED.
+        b = _batch([])
+        b["beacon_readings"] = [{
+            "receiver": "rtl:0", "ts": time.time(), "ref_id": "fm-wbez-915",
+            "freq_hz": 91_500_000, "band": "fm-broadcast",
+            "coverage": "no_reference", "signal_db": -10.0,
+            "noise_db": -30.0, "snr_db": 20.0, "gain": 36.0,
+            "pinned": True, "status": "ok"}]
+        self.db.insert_batch(b)
+        rows = web.beacons(self.db)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["badge"], "observed")
+        page = web.render(self.db, {"sta-a": "not-a-real-pubkey"})
+        self.assertIn("OBSERVED", page)
+        self.assertNotIn("VERIFIED", page)
+
     def test_observer_without_beacon_shows_the_gap(self):
         self.db.insert_batch(_batch([_chk(heard=False)]))
         page = web.render(self.db, {"sta-a": "not-a-real-pubkey"})

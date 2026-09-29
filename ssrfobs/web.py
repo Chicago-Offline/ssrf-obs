@@ -266,8 +266,12 @@ def beacons(db):
             "ok": "verified", "not_heard": "flagged",
             "no_reference": "stale", "error": "flagged",
         }.get(r["status"], "stale")
-        if r["coverage"] == "unverified" and badge == "verified":
-            badge = "observed"  # measured, but antenna undeclared -> unscoreable
+        if r["coverage"] != "ok" and badge == "verified":
+            # Measured, but unscoreable: antenna undeclared (unverified) or
+            # not rated for the band (no_reference -- rf-survey measures
+            # those on every pass since 2026-09-28). Real reception either
+            # way, so it must not read as a calibration pass.
+            badge = "observed"
         out.append(dict(r, age_s=age_s, drift_db=drift_db, badge=badge))
     return out
 

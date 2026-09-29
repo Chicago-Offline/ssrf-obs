@@ -25,12 +25,15 @@ class TestWeb(unittest.TestCase):
         ingest.handle(json.dumps(env).encode(), self.reg, self.db)
 
     def test_empty_surface_renders(self):
+        # Activity is the default screen now, so the observer roster moved
+        # to /network. Each fact is asserted against the page that owns it.
         page = web.render(self.db, self.reg)
-        self.assertIn("RF OBSERVERS", page)
-        # An enrolled station renders even before it reports anything.
-        self.assertIn("sta-a", page)
-        self.assertIn("no beacon reference", page)
+        self.assertIn("Chicago Repeaters", page)
         self.assertIn("no amateur or GMRS repeaters heard", page)
+        net = web.render_network(self.db, self.reg)
+        # An enrolled station renders even before it reports anything.
+        self.assertIn("sta-a", net)
+        self.assertIn("no beacon reference", net)
         self.assertEqual(web.feed(self.db), [])
         self.assertEqual(web.channels(self.db), {})
         self.assertEqual(web.repeaters(self.db), [])
@@ -49,7 +52,8 @@ class TestWeb(unittest.TestCase):
         self.assertEqual(ch[460000000]["level"], "V1")
 
         page = web.render(self.db, self.reg)
-        self.assertIn("sta-a", page)
+        # Observer attribution lives on the Network tab now.
+        self.assertIn("sta-a", web.render_network(self.db, self.reg))
         # Unnamed non-repeater energy stays in the JSON feeds, off the page.
         self.assertNotIn("460.0000 MHz", page)
 

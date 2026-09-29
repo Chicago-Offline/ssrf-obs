@@ -26,7 +26,12 @@ NAV = (("Activity", "/"), ("Repeaters", "/repeaters"),
 ACTIVE_RECENT_S = 3600          # "active recently" -- Eric: 1 hour
 SPARK_BUCKETS = 12              # Eric: 12 buckets, 1 per hour
 SPARK_BUCKET_S = 3600
-HEALTHY_CHECK_S = 300           # "checked within 5 min"
+# Tuned to the measured sweep cadence, not to a round number. On prod
+# 2026-09-28 the 57 monitored targets ran min 6.3 min / p50 12.6 / p90 51.8
+# since attention is round-robined across targets and receivers. A 5-minute
+# bar would read 0/57 forever, which is noise, not health. At 60 min the
+# line reads 52/57 and the 5 it flags are genuinely lagging targets.
+HEALTHY_CHECK_S = 3600
 STALE_CHECK_S = 3600            # per-row warning above this
 RECENT_DAYS = 7
 
@@ -192,6 +197,15 @@ def sparks(db, freqs, buckets=SPARK_BUCKETS, bucket_s=SPARK_BUCKET_S,
 
 # ---------------------------------------------------------------- health
 
+def window_text(seconds):
+    """Render the health window from the constant, so the claim on the page
+    always matches the threshold actually applied."""
+    if seconds % 3600 == 0:
+        h = seconds // 3600
+        return "%d h" % h if h > 1 else "1 h"
+    return "%d min" % (seconds // 60)
+
+
 def health(monitors_map, now=None):
     """Global monitoring health. This is what replaces per-row last-checked."""
     now = now or time.time()
@@ -202,13 +216,14 @@ def health(monitors_map, now=None):
              and now - m["last_checked"] <= HEALTHY_CHECK_S)
     if not total:
         return "\u26a0", AMBER, "No monitored repeaters configured"
+    window = window_text(HEALTHY_CHECK_S)
     if ok == total:
         return ("\u25cf", GREEN,
                 "Monitoring healthy \u00b7 %d/%d repeaters checked within"
-                " 5 min" % (ok, total))
+                " %s" % (ok, total, window))
     return ("\u26a0", AMBER,
             "Monitoring degraded \u00b7 %d/%d repeaters checked within"
-            " 5 min" % (ok, total))
+            " %s" % (ok, total, window))
 
 
 def stale_note(last_checked, now=None):

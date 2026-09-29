@@ -190,9 +190,16 @@ if __name__ == "__main__":
 
 
 class RepeaterPageTest(unittest.TestCase):
-    """The page is a directory: who is observing, and which amateur/GMRS
-    repeaters were actually heard lately. Silence remains a first-class
-    finding, but it lives in /monitors.json now, not on the page."""
+    """Four tabs since the 2026-09-28 redesign.
+
+    render()          -> Activity: what we are hearing, freshness first.
+    render_directory()-> Repeaters: full catalog, never-heard included.
+    render_network()  -> Network: observers, beacon calibration, sweep.
+
+    Each fact is asserted against the page that owns it. Silence is still
+    a first-class finding and is now visible on the Repeaters tab as well
+    as in /monitors.json.
+    """
 
     def setUp(self):
         self.dir = tempfile.mkdtemp()
@@ -201,16 +208,22 @@ class RepeaterPageTest(unittest.TestCase):
     def test_empty_state(self):
         page = web.render(self.db, {})
         self.assertIn("no amateur or GMRS repeaters heard", page)
-        self.assertIn("no stations enrolled", page)
+        self.assertIn("no stations enrolled",
+                      web.render_network(self.db, {}))
 
     def test_heard_monitor_target_is_listed_and_linked(self):
         self.db.insert_batch(_batch([_chk(heard=True, ts=time.time())]))
         page = web.render(self.db, {})
-        self.assertIn("NS9RC 145.470", page)
+        # Activity leads with frequency and callsign, per the brief.
+        self.assertIn("145.4700", page)
+        self.assertIn("NS9RC", page)
         # Deep link into the ssrf-lite browser by callsign.
         self.assertIn("ssrf-lite/#browse?q=NS9RC", page)
-        # Heard-by attribution must survive the simplification.
-        self.assertIn("sta-a/rtl:0", page)
+        # The full catalog name and heard-by attribution survive the
+        # simplification -- they move to the directory table.
+        d = web.render_directory(self.db)
+        self.assertIn("NS9RC 145.470", d)
+        self.assertIn("sta-a/rtl:0", d)
 
     def test_silent_target_stays_off_the_page_but_in_the_data(self):
         now = time.time()
@@ -243,9 +256,11 @@ class RepeaterPageTest(unittest.TestCase):
         self.assertIn("CC 1", page)
 
     def test_no_claim_renders_a_dash_not_an_error(self):
+        # Activity omits an absent tone entirely rather than printing a
+        # placeholder; the directory table still needs a cell, so the
+        # em dash lives there.
         self.db.insert_batch(_batch([_chk(heard=True, ts=time.time())]))
-        page = web.render(self.db, {})
-        self.assertIn("&mdash;", page)
+        self.assertIn("&mdash;", web.render_directory(self.db))
 
     def test_repeaters_json_shape(self):
         self.db.insert_batch(_batch([_chk(heard=True, ts=time.time())]))
@@ -265,7 +280,7 @@ class RepeaterPageTest(unittest.TestCase):
             "signal_db": -20.0, "noise_db": -35.0, "snr_db": 15.0,
             "gain": 30.0, "pinned": True, "status": "ok"}]
         self.db.insert_batch(b)
-        page = web.render(self.db, {"sta-a": "not-a-real-pubkey"})
+        page = web.render_network(self.db, {"sta-a": "not-a-real-pubkey"})
         self.assertIn("WA9ORC", page)
         self.assertIn("sta-a", page)
         self.assertIn("VERIFIED", page)
@@ -285,11 +300,11 @@ class RepeaterPageTest(unittest.TestCase):
         rows = web.beacons(self.db)
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["badge"], "observed")
-        page = web.render(self.db, {"sta-a": "not-a-real-pubkey"})
+        page = web.render_network(self.db, {"sta-a": "not-a-real-pubkey"})
         self.assertIn("OBSERVED", page)
         self.assertNotIn("VERIFIED", page)
 
     def test_observer_without_beacon_shows_the_gap(self):
         self.db.insert_batch(_batch([_chk(heard=False)]))
-        page = web.render(self.db, {"sta-a": "not-a-real-pubkey"})
+        page = web.render_network(self.db, {"sta-a": "not-a-real-pubkey"})
         self.assertIn("no beacon reference", page)

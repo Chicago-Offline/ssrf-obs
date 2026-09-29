@@ -19,11 +19,12 @@ Station public keys are NEVER served -- only station ids.
 import html
 import json
 import logging
+import sys
 import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from . import names as names_mod, rules
+from . import names as names_mod, rules, ui
 
 log = logging.getLogger(__name__)
 
@@ -557,89 +558,33 @@ def _fnum(v, fmt="%.1f", dash="-"):
     return dash if v is None else fmt % v
 
 
+def _self():
+    """This module, for ui.py to reuse without a circular import."""
+    return sys.modules[__name__]
+
+
 def render(db, registry, index=None):
-    # ------------------------------------------- observers + calibration
-    sts = stations(db, registry)
-    cal = {}
-    for b in beacons(db):
-        cal.setdefault(b["station_id"], []).append(b)
-    if sts:
-        rows = ""
-        for s in sts:
-            refs = sorted(cal.get(s["station_id"], []),
-                          key=lambda x: (x["receiver"], x["freq_hz"]))
-            if not refs:
-                # An observer with no beacon reference is still an
-                # observer -- show it, and show the gap.
-                rows += "<tr>" + "".join((
-                    _td(html.escape(s["station_id"]), s["station_id"]),
-                    _td('<span class="unk">&mdash;</span>', ""),
-                    _td('<span class="unk">no beacon reference</span>', ""),
-                    _td("-", ""), _td("-", ""), _td("-", ""), _td("-", ""),
-                    _td(_ago(s["last_batch"]), s["last_batch"] or ""),
-                )) + "</tr>"
-                continue
-            for b in refs:
-                color = BADGE.get(b["badge"], "#888")
-                ref = ('%s <span class="hint">@ %.4f MHz</span>'
-                       % (html.escape(b["ref_id"]), b["freq_hz"] / 1e6))
-                rows += "<tr>" + "".join((
-                    _td(html.escape(s["station_id"]), s["station_id"]),
-                    _td(html.escape(b["receiver"]), b["receiver"]),
-                    _td(ref, b["ref_id"]),
-                    _td('<span class="b" style="background:%s">%s</span>'
-                        % (color, b["badge"].upper()), b["badge"]),
-                    _td(_fnum(b["snr_db"]),
-                        "" if b["snr_db"] is None else b["snr_db"]),
-                    _td(_fnum(b["drift_db"], "%+.1f", "n/a"),
-                        "" if b["drift_db"] is None else b["drift_db"]),
-                    _td(_ago(b["ts"]), b["ts"]),
-                    _td(_ago(s["last_batch"]), s["last_batch"] or ""),
-                )) + "</tr>"
-        obs_html = _table(["station", "receiver", "calibrated to", "status",
-                           "SNR dB", "drift", "last reading", "last report"],
-                          rows, tid="obstable")
-    else:
-        obs_html = '<p class="empty">no stations enrolled</p>'
+    """Default page = the Activity tab.
 
-    # ------------------------------------------- repeaters heard recently
-    reps = repeaters(db, index)
-    if reps:
-        rows = ""
-        for r in reps:
-            name = r["name"] or "?"
-            label = html.escape(name)
-            call = r["callsign"]
-            if call and call not in name:
-                label += (' <span class="hint">(%s)</span>'
-                          % html.escape(call))
-            cell = ('<a href="%s">%s</a>'
-                    % (html.escape(r["link"], quote=True), label))
-            who = ", ".join(r["heard_by"] or [])
-            rows += "<tr>" + "".join((
-                _td("%.4f MHz" % r["freq_mhz"], "%.6f" % r["freq_mhz"]),
-                _td(cell, name),
-                _td(html.escape(r["service"] or "-"), r["service"] or ""),
-                _td(html.escape(r["mode"] or "-"), r["mode"] or ""),
-                _td(html.escape(r["tone"]) if r["tone"]
-                    else '<span class="unk">&mdash;</span>',
-                    r["tone"] or "", cls="tone"),
-                _td(_ago(r["last_heard"]), r["last_heard"] or ""),
-                _td(html.escape(who) or '<span class="unk">&mdash;</span>',
-                    who, cls="who"),
-            )) + "</tr>"
-        rep_html = _table(["frequency", "repeater", "service", "mode",
-                           "tone / CC", "last heard", "heard by"],
-                          rows, tid="reptable")
-        rep_n = "%d heard" % len(reps)
-    else:
-        rep_html = ('<p class="empty">no amateur or GMRS repeaters heard in '
-                    "the last %d days</p>" % (RECENT_S // 86400))
-        rep_n = "none yet"
+    Page layout lives in ui.py. This stays as the entry point that
+    existing callers and tests already import.
+    """
+    return ui.activity(db, index, web=_self())
 
-    return PAGE.format(observers=obs_html, repeaters=rep_html, repn=rep_n,
-                       days=RECENT_S // 86400, script=SCRIPT,
-                       now=time.strftime("%Y-%m-%d %H:%M:%SZ", time.gmtime()))
+
+def render_directory(db, registry=None, index=None):
+    """Repeaters tab: the full catalog, never-heard included."""
+    return ui.directory(db, index, web=_self())
+
+
+def render_investigate(db=None, registry=None, index=None):
+    """Investigate tab: not built yet, and says so."""
+    return ui.investigate()
+
+
+def render_network(db, registry, index=None):
+    """Network tab: observers, calibration, receivers, sweep."""
+    return ui.network(db, registry, index, web=_self())
 
 
 def make_handler(db, registry, index=None):
@@ -667,6 +612,17 @@ def make_handler(db, registry, index=None):
             try:
                 if u.path == "/":
                     self._send(200, render(db, registry, index),
+                               "text/html; charset=utf-8")
+                elif u.path in ("/repeaters", "/repeaters/"):
+                    self._send(200,
+                               render_directory(db, registry, index),
+                               "text/html; charset=utf-8")
+                elif u.path in ("/investigate", "/investigate/"):
+                    self._send(200, render_investigate(),
+                               "text/html; charset=utf-8")
+                elif u.path in ("/network", "/network/"):
+                    self._send(200,
+                               render_network(db, registry, index),
                                "text/html; charset=utf-8")
                 elif u.path == "/repeaters.json":
                     items = repeaters(db, index)

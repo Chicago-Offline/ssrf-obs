@@ -159,6 +159,57 @@ def stations(db, registry):
             for sid in sorted(registry)]
 
 
+# rf-survey sends a heartbeat once per submit loop. The deployed cadence on
+# meshpi is `survey submit --loop 300`, i.e. one every 5 min, so three
+# consecutive misses is the quietest a healthy station should ever look.
+# Not a guess: read from rf-survey-submit.service on 2026-09-29. If an
+# observer is ever deployed with a different --loop, this needs revisiting.
+HEARTBEAT_INTERVAL_S = 300
+OBSERVER_ONLINE_S = 3 * HEARTBEAT_INTERVAL_S
+
+
+def observers(db, registry, now=None):
+    """Per-station liveness for the 'observers online' pill.
+
+    🔴 Heartbeats are UNSIGNED (see db.SCHEMA station_status). This function
+    reports what a station claims about itself. It is deliberately kept
+    apart from stations()/active(), which report verified evidence, so an
+    unsigned claim can never leak into an on-air assertion.
+
+    Freshness is computed from the station's own ts, never from arrival
+    time: the status topic is retained, so the broker replays the last
+    heartbeat to us on every reconnect and arrival proves nothing.
+
+    'online' here means "told us it was alive recently" -- NOT "is
+    collecting". A station whose monitor loop has died still submits and
+    still heartbeats. Callers must not render this as 'monitoring healthy'.
+    """
+    now = time.time() if now is None else now
+    status = {r["station_id"]: r for r in db.status_rows()}
+    out = []
+    for sid in sorted(registry):
+        row = status.get(sid)
+        if row is None:
+            out.append({"station_id": sid, "heartbeat": False,
+                        "online": False, "age_s": None, "ts": None,
+                        "pending": None, "skew_s": None})
+            continue
+        age = now - row["ts"]
+        out.append({
+            "station_id": sid,
+            "heartbeat": True,
+            # Negative age = station clock ahead of ours. Still "online"
+            # (it just spoke), but surfaced via skew_s so a badly-set clock
+            # shows up as a clock problem instead of silent weirdness.
+            "online": age <= OBSERVER_ONLINE_S,
+            "age_s": age,
+            "ts": row["ts"],
+            "pending": row["pending"],
+            "skew_s": row["received_at"] - row["ts"],
+        })
+    return out
+
+
 def feed(db, limit=DEFAULT_LIMIT, freq_hz=None, index=None, since=None):
     """Recent observations, newest first.
 
@@ -656,6 +707,18 @@ def make_handler(db, registry, index=None):
                                 "monitors": mons})
                 elif u.path == "/stations.json":
                     self._json({"stations": stations(db, registry)})
+                elif u.path == "/observers.json":
+                    obs_l = observers(db, registry)
+                    self._json({
+                        "generated": time.time(),
+                        # Spelled out in the payload so no downstream
+                        # consumer mistakes liveness for verified evidence.
+                        "source": "rfsurvey.status.v1 heartbeat (UNSIGNED)",
+                        "evidence": False,
+                        "online_threshold_s": OBSERVER_ONLINE_S,
+                        "online": sum(1 for o in obs_l if o["online"]),
+                        "enrolled": len(obs_l),
+                        "observers": obs_l})
                 elif u.path == "/beacons.json":
                     self._json({"generated": time.time(),
                                 "beacons": beacons(db)})

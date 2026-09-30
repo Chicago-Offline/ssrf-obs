@@ -98,6 +98,36 @@ CREATE TABLE IF NOT EXISTS monitor_checks (
 CREATE INDEX IF NOT EXISTS mc_chan ON monitor_checks(freq_hz, target, ts);
 CREATE INDEX IF NOT EXISTS mc_ssrf ON monitor_checks(ssrf_id);
 CREATE INDEX IF NOT EXISTS mc_obs ON monitor_checks(station_id, receiver);
+
+-- Station heartbeats (rf-survey `rfsurvey.status.v1`, topic
+-- <prefix>/status/<station_id>).
+--
+-- 🔴 UNSIGNED, UNLIKE EVERYTHING ELSE IN THIS FILE. rf-survey's
+-- Publisher.heartbeat() publishes bare JSON with no Ed25519 envelope, so
+-- these rows carry a station's *claim* about itself that we cannot verify.
+-- They are advisory liveness only. NEVER let a status row back an
+-- evidence claim -- not "heard", not "checked", not a parameter grade.
+-- Anything the page asserts about the air must still come from
+-- observations / monitor_checks / beacon_readings.
+--
+-- Why store them at all: build_batch() returns None when a station has no
+-- unsubmitted evidence, so a WEDGED observer (the known rtl_power hang)
+-- and a merely quiet band both produce total silence on obs/#. The
+-- heartbeat is the only signal that separates "looking, heard nothing"
+-- from "not looking". That is worth having even unsigned.
+--
+-- One row per station, latest wins. Retained-topic hazard: the broker
+-- replays the last heartbeat on every reconnect, so arrival time proves
+-- nothing about liveness -- ts is the station's own clock and is what
+-- freshness must be computed from. received_at is kept only to expose
+-- skew between the two.
+CREATE TABLE IF NOT EXISTS station_status (
+  station_id TEXT PRIMARY KEY,
+  ts REAL NOT NULL,           -- station's claimed clock, drives freshness
+  received_at REAL NOT NULL,  -- our clock on arrival, for skew only
+  pending INTEGER,
+  payload TEXT NOT NULL       -- full status doc, forward-compatible
+);
 """
 
 
@@ -179,6 +209,50 @@ class DB:
              if c.get("target") and c.get("freq_hz") is not None])
         self.db.commit()
         return True
+
+    def upsert_status(self, station_id, ts, payload, received_at=None):
+        """Record a heartbeat. Monotonic in ts: an older heartbeat never
+        overwrites a newer one.
+
+        That guard is not paranoia. The status topic is retained, so a
+        reconnect replays whatever was last published; without the ts
+        compare, a stale retained frame from a station that died hours ago
+        would clobber a fresh one and make a dead observer look current.
+        """
+        if ts is None:
+            return False
+        received_at = time.time() if received_at is None else received_at
+        cur = self.db.execute(
+            "SELECT ts FROM station_status WHERE station_id=?",
+            (station_id,)).fetchone()
+        if cur and cur[0] is not None and float(cur[0]) >= float(ts):
+            return False
+        self.db.execute(
+            "INSERT INTO station_status(station_id,ts,received_at,pending,"
+            "payload) VALUES(?,?,?,?,?)"
+            " ON CONFLICT(station_id) DO UPDATE SET ts=excluded.ts,"
+            " received_at=excluded.received_at, pending=excluded.pending,"
+            " payload=excluded.payload",
+            (station_id, float(ts), float(received_at),
+             payload.get("pending"), json.dumps(payload)))
+        self.db.commit()
+        return True
+
+    def status_rows(self):
+        """Latest heartbeat per station. Advisory only -- see schema note."""
+        cols = ("station_id", "ts", "received_at", "pending", "payload")
+        rows = self.db.execute(
+            "SELECT station_id,ts,received_at,pending,payload"
+            " FROM station_status").fetchall()
+        out = []
+        for r in rows:
+            d = dict(zip(cols, r))
+            try:
+                d["payload"] = json.loads(d["payload"] or "{}")
+            except ValueError:
+                d["payload"] = {}
+            out.append(d)
+        return out
 
     def observation_rows(self, freq_hz=None):
         q = ("SELECT station_id, ts, freq_hz, snr_db, decoder, gated, meta"

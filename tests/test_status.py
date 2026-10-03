@@ -28,6 +28,12 @@ def status(sid=SID, ts=None, schema="rfsurvey.status.v1", **extra):
     return json.dumps(doc).encode()
 
 
+def v2(ts=None, receivers=None, stale_after_s=3600, **extra):
+    return status(ts=ts, schema="rfsurvey.status.v2",
+                  receivers={} if receivers is None else receivers,
+                  stale_after_s=stale_after_s, **extra)
+
+
 class StatusIngestTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
@@ -173,6 +179,133 @@ class ObserversTest(unittest.TestCase):
         self.assertEqual(st["observations"], 0)
         self.assertEqual(st["sweep_bins"], 0)
         self.assertIsNone(st["last_batch"])
+
+
+class ReceiverHealthTest(unittest.TestCase):
+    """v2 receiver liveness: 'online' and 'collecting' are not the same."""
+
+    def setUp(self):
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmp.close()
+        self.db = DB(self.tmp.name)
+
+    def tearDown(self):
+        os.unlink(self.tmp.name)
+
+    def _put(self, payload):
+        ingest.handle_status(payload, REG, self.db, topic_station_id=SID)
+
+    def test_v1_reports_unknown_not_broken(self):
+        """An old publisher cannot report health; that is not a failure."""
+        self._put(status())
+        out = web.observers(self.db, REG)[0]
+        self.assertTrue(out["online"])
+        self.assertIsNone(out["collecting"])
+        self.assertIsNone(out["receivers_total"])
+
+    def test_no_heartbeat_reports_unknown_collecting(self):
+        out = web.observers(self.db, REG)[0]
+        self.assertFalse(out["online"])
+        self.assertIsNone(out["collecting"])
+        self.assertEqual(out["receivers"], {})
+
+    def test_fresh_receivers_are_collecting(self):
+        now = time.time()
+        self._put(v2(ts=now, receivers={
+            "BENCH": {"last_sweep_ts": now - 30, "last_sweep_age_s": 30},
+            "ADSB": {"last_sweep_ts": now - 20, "last_sweep_age_s": 20}}))
+        out = web.observers(self.db, REG, now=now)[0]
+        self.assertTrue(out["collecting"])
+        self.assertEqual(out["receivers_healthy"], 2)
+        self.assertEqual(out["receivers_total"], 2)
+
+    def test_online_but_not_collecting(self):
+        """meshpi's real failure: submit loop fine, radios dead for days."""
+        now = time.time()
+        stale = 3 * 86400
+        self._put(v2(ts=now, pending=0, receivers={
+            "BENCH": {"last_sweep_ts": now - stale,
+                      "last_sweep_age_s": stale, "healthy": False},
+            "ADSB": {"last_sweep_ts": now - stale,
+                     "last_sweep_age_s": stale, "healthy": False}}))
+        out = web.observers(self.db, REG, now=now)[0]
+        self.assertTrue(out["online"])
+        self.assertFalse(out["collecting"])
+        self.assertEqual(out["receivers_healthy"], 0)
+
+    def test_ages_are_advanced_by_heartbeat_age(self):
+        """A stale heartbeat carries stale ages; they must not read fresh.
+
+        Without this the station reports a 30-second-old sweep forever,
+        which is precisely the blind spot the field exists to close.
+        """
+        now = time.time()
+        hb = now - 2 * 86400
+        self._put(v2(ts=hb, receivers={
+            "BENCH": {"last_sweep_ts": hb - 30, "last_sweep_age_s": 30,
+                      "healthy": True}}))
+        out = web.observers(self.db, REG, now=now)[0]
+        bench = out["receivers"]["BENCH"]
+        self.assertGreater(bench["last_sweep_age_s"], 86400)
+        self.assertFalse(bench["healthy"])
+        self.assertFalse(out["collecting"])
+
+    def test_station_healthy_claim_is_not_trusted(self):
+        """The station said healthy at publish time; we recompute for now."""
+        now = time.time()
+        self._put(v2(ts=now, stale_after_s=10, receivers={
+            "BENCH": {"last_sweep_ts": now - 600, "last_sweep_age_s": 600,
+                      "healthy": True}}))
+        out = web.observers(self.db, REG, now=now)[0]
+        self.assertFalse(out["receivers"]["BENCH"]["healthy"])
+        self.assertFalse(out["collecting"])
+
+    def test_partial_outage_still_collecting(self):
+        now = time.time()
+        self._put(v2(ts=now, receivers={
+            "BENCH": {"last_sweep_ts": now - 10, "last_sweep_age_s": 10},
+            "ADSB": {"last_sweep_ts": now - 99999,
+                     "last_sweep_age_s": 99999}}))
+        out = web.observers(self.db, REG, now=now)[0]
+        self.assertTrue(out["collecting"])
+        self.assertEqual(out["receivers_healthy"], 1)
+        self.assertEqual(out["receivers_total"], 2)
+
+    def test_monitor_only_receiver_counts_as_alive(self):
+        now = time.time()
+        self._put(v2(ts=now, receivers={
+            "SONDE": {"last_check_ts": now - 15, "last_check_age_s": 15}}))
+        out = web.observers(self.db, REG, now=now)[0]
+        self.assertTrue(out["collecting"])
+
+    def test_receiver_with_no_timestamps_is_unhealthy(self):
+        now = time.time()
+        self._put(v2(ts=now, receivers={"BENCH": {}}))
+        out = web.observers(self.db, REG, now=now)[0]
+        self.assertFalse(out["receivers"]["BENCH"]["healthy"])
+        self.assertFalse(out["collecting"])
+
+    def test_malformed_receiver_block_does_not_crash(self):
+        now = time.time()
+        self._put(v2(ts=now, receivers={"BENCH": "not-a-dict", "ADSB": None}))
+        out = web.observers(self.db, REG, now=now)[0]
+        self.assertEqual(out["receivers"], {})
+        self.assertEqual(out["receivers_total"], 0)
+
+    def test_receivers_not_a_dict_reports_unknown(self):
+        now = time.time()
+        self._put(v2(ts=now, receivers=["BENCH"]))
+        out = web.observers(self.db, REG, now=now)[0]
+        self.assertIsNone(out["collecting"])
+
+    def test_health_creates_no_evidence(self):
+        """v2 adds liveness only -- never an air claim."""
+        now = time.time()
+        self._put(v2(ts=now, receivers={
+            "BENCH": {"last_sweep_ts": now - 5, "last_sweep_age_s": 5}}))
+        self.assertIsNone(web.last_observation_ts(self.db))
+        self.assertEqual(web.active(self.db), [])
+        self.assertEqual(web.stations(self.db, REG)[0]["observations"], 0)
 
 
 if __name__ == "__main__":

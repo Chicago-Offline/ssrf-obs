@@ -168,6 +168,49 @@ HEARTBEAT_INTERVAL_S = 300
 OBSERVER_ONLINE_S = 3 * HEARTBEAT_INTERVAL_S
 
 
+def _receiver_health(doc, heartbeat_age_s):
+    """Radio liveness from a rfsurvey.status.v2 heartbeat, aged to now.
+
+    The station computed these ages against its own clock at publish time,
+    so a heartbeat that is itself stale carries ages that are equally
+    stale. Every age is advanced by the heartbeat's own age; otherwise a
+    station dead for two days keeps reporting a 30-second-old sweep,
+    which is the exact failure this field exists to catch.
+
+    The station's own healthy flag is recomputed here for the same reason:
+    it was true when published and says nothing about now.
+
+    A v1 heartbeat carries no receiver block and reports unknown (None),
+    never False -- an old publisher has not claimed that it is broken.
+    """
+    recs = doc.get("receivers")
+    if not isinstance(recs, dict):
+        return {"collecting": None, "receivers_total": None,
+                "receivers_healthy": None, "receivers": {}}
+    bump = max(0.0, heartbeat_age_s)
+    stale_after = doc.get("stale_after_s")
+    out, healthy = {}, 0
+    for serial, d in sorted(recs.items()):
+        if not isinstance(d, dict):
+            continue
+        e = {}
+        for k in ("last_sweep_ts", "last_check_ts"):
+            if isinstance(d.get(k), (int, float)):
+                e[k] = d[k]
+        for k in ("last_sweep_age_s", "last_check_age_s"):
+            if isinstance(d.get(k), (int, float)):
+                e[k] = d[k] + bump
+        ages = [v for k, v in e.items() if k.endswith("_age_s")]
+        ok = bool(ages) and (stale_after is None or min(ages) <= stale_after)
+        e["healthy"] = ok
+        healthy += 1 if ok else 0
+        out[serial] = e
+    return {"collecting": healthy > 0,
+            "receivers_total": len(out),
+            "receivers_healthy": healthy,
+            "receivers": out}
+
+
 def observers(db, registry, now=None):
     """Per-station liveness for the 'observers online' pill.
 
@@ -182,7 +225,12 @@ def observers(db, registry, now=None):
 
     'online' here means "told us it was alive recently" -- NOT "is
     collecting". A station whose monitor loop has died still submits and
-    still heartbeats. Callers must not render this as 'monitoring healthy'.
+    still heartbeats. Callers must not render this as 'monitoring healthy';
+    render 'collecting' for that, which is populated from the v2 receiver
+    block and is the field that actually goes false when the radios stop.
+
+    collecting is None, not False, for a v1 publisher that cannot report
+    receiver health -- unknown and broken must not look the same.
     """
     now = time.time() if now is None else now
     status = {r["station_id"]: r for r in db.status_rows()}
@@ -192,7 +240,9 @@ def observers(db, registry, now=None):
         if row is None:
             out.append({"station_id": sid, "heartbeat": False,
                         "online": False, "age_s": None, "ts": None,
-                        "pending": None, "skew_s": None})
+                        "pending": None, "skew_s": None,
+                        "collecting": None, "receivers_total": None,
+                        "receivers_healthy": None, "receivers": {}})
             continue
         age = now - row["ts"]
         out.append({
@@ -206,6 +256,9 @@ def observers(db, registry, now=None):
             "ts": row["ts"],
             "pending": row["pending"],
             "skew_s": row["received_at"] - row["ts"],
+            # Radio liveness, kept separate from 'online' on purpose:
+            # online means it spoke, collecting means it is still hearing.
+            **_receiver_health(row.get("payload") or {}, age),
         })
     return out
 

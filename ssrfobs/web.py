@@ -168,6 +168,27 @@ HEARTBEAT_INTERVAL_S = 300
 OBSERVER_ONLINE_S = 3 * HEARTBEAT_INTERVAL_S
 
 
+def status_source(db):
+    """Describe which heartbeat schemas actually fed this response.
+
+    Hardcoding a version here went stale the moment one station upgraded:
+    the field read v1 while already serving v2 receiver health from
+    meshpi. A fleet is mixed for the whole length of any rollout, so
+    report what is genuinely present rather than what we expect.
+
+    The UNSIGNED marker is never dropped -- the schema version changes,
+    but the trust level of this input does not.
+    """
+    seen = sorted({
+        r["payload"].get("schema")
+        for r in db.status_rows()
+        if isinstance(r.get("payload"), dict)
+        and isinstance(r["payload"].get("schema"), str)
+    })
+    return (", ".join(seen) if seen else "rfsurvey.status.*") + \
+        " heartbeat (UNSIGNED)"
+
+
 def _receiver_health(doc, heartbeat_age_s):
     """Radio liveness from a rfsurvey.status.v2 heartbeat, aged to now.
 
@@ -766,7 +787,7 @@ def make_handler(db, registry, index=None):
                         "generated": time.time(),
                         # Spelled out in the payload so no downstream
                         # consumer mistakes liveness for verified evidence.
-                        "source": "rfsurvey.status.v1 heartbeat (UNSIGNED)",
+                        "source": status_source(db),
                         "evidence": False,
                         "online_threshold_s": OBSERVER_ONLINE_S,
                         "online": sum(1 for o in obs_l if o["online"]),

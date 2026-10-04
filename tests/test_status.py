@@ -1,4 +1,4 @@
-"""Heartbeat (rfsurvey.status.v1) ingest and observer liveness.
+"""Heartbeat (rfsurvey.status.v1/v2) ingest and observer liveness.
 
 The status topic is the one unsigned input this service accepts, so these
 tests care as much about what a heartbeat is NOT allowed to do as about the
@@ -306,6 +306,50 @@ class ReceiverHealthTest(unittest.TestCase):
         self.assertIsNone(web.last_observation_ts(self.db))
         self.assertEqual(web.active(self.db), [])
         self.assertEqual(web.stations(self.db, REG)[0]["observations"], 0)
+
+
+class StatusSourceTest(unittest.TestCase):
+    """The source label must describe what actually fed the response."""
+
+    def setUp(self):
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmp.close()
+        self.db = DB(self.tmp.name)
+
+    def tearDown(self):
+        os.unlink(self.tmp.name)
+
+    def test_empty_reports_wildcard_not_a_version(self):
+        self.assertEqual(web.status_source(self.db),
+                         "rfsurvey.status.* heartbeat (UNSIGNED)")
+
+    def test_v1_only(self):
+        ingest.handle_status(status(), REG, self.db, topic_station_id=SID)
+        self.assertEqual(web.status_source(self.db),
+                         "rfsurvey.status.v1 heartbeat (UNSIGNED)")
+
+    def test_v2_only_does_not_claim_v1(self):
+        """The regression: label read v1 while serving v2 data."""
+        ingest.handle_status(v2(), REG, self.db, topic_station_id=SID)
+        s = web.status_source(self.db)
+        self.assertIn("rfsurvey.status.v2", s)
+        self.assertNotIn("v1", s)
+
+    def test_mixed_fleet_lists_both(self):
+        """A rollout is mixed for its whole length; pick neither side."""
+        sid2 = "obs-muehlmini"
+        reg = {SID: "k", sid2: "k"}
+        ingest.handle_status(status(), reg, self.db, topic_station_id=SID)
+        ingest.handle_status(status(sid=sid2, schema="rfsurvey.status.v2"),
+                             reg, self.db, topic_station_id=sid2)
+        s = web.status_source(self.db)
+        self.assertIn("rfsurvey.status.v1", s)
+        self.assertIn("rfsurvey.status.v2", s)
+
+    def test_unsigned_marker_survives_every_version(self):
+        """Schema version changes; the trust level of this input does not."""
+        ingest.handle_status(v2(), REG, self.db, topic_station_id=SID)
+        self.assertIn("UNSIGNED", web.status_source(self.db))
 
 
 if __name__ == "__main__":

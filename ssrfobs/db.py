@@ -99,7 +99,7 @@ CREATE INDEX IF NOT EXISTS mc_chan ON monitor_checks(freq_hz, target, ts);
 CREATE INDEX IF NOT EXISTS mc_ssrf ON monitor_checks(ssrf_id);
 CREATE INDEX IF NOT EXISTS mc_obs ON monitor_checks(station_id, receiver);
 
--- Station heartbeats (rf-survey `rfsurvey.status.v1`, topic
+-- Station heartbeats (rf-survey `rfsurvey.status.*`, currently v2, topic
 -- <prefix>/status/<station_id>).
 --
 -- 🔴 UNSIGNED, UNLIKE EVERYTHING ELSE IN THIS FILE. rf-survey's
